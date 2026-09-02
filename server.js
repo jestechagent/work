@@ -215,15 +215,76 @@ app.post('/api/proxies', async (req, res) => {
   const { origin_url, name } = req.body;
 
   if (!origin_url || !name) {
-    return res.status(400).json({ error: 'Missing origin_url or name' });
+    return res.status(400).json({ error: 'Missing origin_url or name. Please enter both URL and proxy name.' });
   }
 
-  if (!validateURL(origin_url)) {
-    return res.status(400).json({ error: 'Invalid or private URL' });
+  // Validate URL format
+  try {
+    const urlObj = new URL(origin_url.startsWith('http') ? origin_url : `https://${origin_url}`);
+    
+    // Check for private IPs
+    const hostname = urlObj.hostname;
+    if (
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname.startsWith('192.168.') ||
+      hostname.startsWith('10.') ||
+      hostname.startsWith('172.')
+    ) {
+      return res.status(400).json({ 
+        error: 'Cannot proxy private/internal URLs (localhost, 192.168.x.x, 10.x.x.x, 172.x.x.x)' 
+      });
+    }
+  } catch (e) {
+    return res.status(400).json({ 
+      error: `Invalid URL format. Make sure to include https:// (e.g., https://example.com). Error: ${e.message}` 
+    });
   }
 
   const id = generateSlug();
   const originUrl = origin_url.startsWith('http') ? origin_url : `https://${origin_url}`;
+
+  // Test if URL is reachable before creating proxy
+  try {
+    console.log(`Testing connectivity to: ${originUrl}`);
+    const testResponse = await fetch(originUrl, { 
+      method: 'HEAD',
+      timeout: 8000,
+      redirect: 'follow'
+    });
+    
+    console.log(`Response from ${originUrl}: ${testResponse.status} ${testResponse.statusText}`);
+    
+    if (testResponse.status === 404) {
+      return res.status(400).json({ 
+        error: `URL returned 404 Not Found. Please verify the path is correct.`,
+        details: `URL: ${originUrl}`,
+        hint: 'The server responded with 404. Check if the exact path exists on the server.'
+      });
+    }
+    
+    if (testResponse.status >= 500) {
+      return res.status(400).json({ 
+        error: `Server error (${testResponse.status}). The target server returned an error.`,
+        details: `URL: ${originUrl}`
+      });
+    }
+    
+    console.log(`✅ URL is reachable: ${originUrl}`);
+  } catch (testErr) {
+    console.error(`❌ Cannot reach URL: ${originUrl}`, testErr.message);
+    return res.status(400).json({ 
+      error: `Cannot reach the URL. The server may be offline or inaccessible.`,
+      details: `URL: ${originUrl}`,
+      technical_error: testErr.message,
+      hints: [
+        '1. Make sure the URL is correct and online',
+        '2. Check if it\'s accessible from the internet (not behind a firewall)',
+        '3. Try visiting the URL in your browser first to verify it works',
+        '4. If using a dynamic DNS, make sure it\'s updated correctly'
+      ]
+    });
+  }
 
   try {
     await pool.query(
@@ -235,7 +296,7 @@ app.post('/api/proxies', async (req, res) => {
     res.json({ id, proxy_url: proxyUrl, name, origin_url: originUrl });
   } catch (err) {
     console.error('Error creating proxy:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: `Database error: ${err.message}` });
   }
 });
 
