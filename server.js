@@ -516,7 +516,7 @@ app.all('/:proxyId*', async (req, res) => {
       const options = {
         method,
         headers,
-        redirect: 'follow',
+        redirect: 'manual',
       };
 
       if (['POST', 'PUT', 'PATCH'].includes(method)) {
@@ -535,44 +535,68 @@ app.all('/:proxyId*', async (req, res) => {
       // Check if response is a redirect (3xx status code)
       if (response.status >= 300 && response.status < 400 && locationHeader) {
         try {
+          console.log(`[REDIRECT] Status: ${response.status}, Location: ${locationHeader}`);
+          
           const redirectUrl = new URL(locationHeader, targetUrl.toString());
           const originUrlObj = new URL(proxy.origin_url);
 
+          console.log(`[REDIRECT] Redirect hostname: ${redirectUrl.hostname}, Origin hostname: ${originUrlObj.hostname}`);
+
           // If redirect is to a DIFFERENT domain, allow external redirect
           if (redirectUrl.hostname !== originUrlObj.hostname) {
-            // External redirect - let browser go to the other site
+            console.log(`[REDIRECT] External redirect detected - allowing to ${redirectUrl.hostname}`);
+            
+            // External redirect - send the redirect response with the original location
             res.status(response.status);
+            res.set('Location', locationHeader);
+            
+            // Copy other important headers
             response.headers.forEach((value, name) => {
-              if (!['content-encoding', 'transfer-encoding'].includes(name.toLowerCase())) {
+              const lowerName = name.toLowerCase();
+              if (!['content-encoding', 'transfer-encoding', 'location'].includes(lowerName)) {
                 res.set(name, value);
               }
             });
-            return res.send(body);
+            
+            return res.end();
           } else {
+            console.log(`[REDIRECT] Internal redirect detected - rewriting to stay on proxy`);
+            
             // Internal redirect - rewrite to go through proxy
             const internalPath = redirectUrl.pathname + redirectUrl.search;
             const rewrittenLocation = `/${proxyId}${internalPath}`;
             
+            console.log(`[REDIRECT] Rewritten location: ${rewrittenLocation}`);
+            
             res.status(response.status);
+            res.set('Location', rewrittenLocation);
+            
+            // Copy other important headers
             response.headers.forEach((value, name) => {
-              if (name.toLowerCase() === 'location') {
-                res.set('Location', rewrittenLocation);
-              } else if (!['content-encoding', 'transfer-encoding'].includes(name.toLowerCase())) {
+              const lowerName = name.toLowerCase();
+              if (!['content-encoding', 'transfer-encoding', 'location'].includes(lowerName)) {
                 res.set(name, value);
               }
             });
-            return res.send(body);
+            
+            return res.end();
           }
         } catch (e) {
-          console.error('Error handling redirect:', e);
+          console.error('[REDIRECT] Error handling redirect:', e);
+          console.error('[REDIRECT] Falling back to direct redirect response');
+          
           // If parsing fails, just pass through the redirect
           res.status(response.status);
+          res.set('Location', locationHeader);
+          
           response.headers.forEach((value, name) => {
-            if (!['content-encoding', 'transfer-encoding'].includes(name.toLowerCase())) {
+            const lowerName = name.toLowerCase();
+            if (!['content-encoding', 'transfer-encoding', 'location'].includes(lowerName)) {
               res.set(name, value);
             }
           });
-          return res.send(body);
+          
+          return res.end();
         }
       }
       // ===== END REDIRECT HANDLING =====
