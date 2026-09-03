@@ -463,7 +463,7 @@ app.post('/api/stats/:proxyId', async (req, res) => {
 });
 
 // ============================================================================
-// PROXY ROUTES - WITH REAL-TIME CLICK TRACKING (FIXED REDIRECTS)
+// PROXY ROUTES - WITH REAL-TIME CLICK TRACKING
 // ============================================================================
 
 app.all('/:proxyId*', async (req, res) => {
@@ -557,8 +557,7 @@ app.all('/:proxyId*', async (req, res) => {
       const contentType = response.headers.get('content-type');
       const locationHeader = response.headers.get('location');
 
-      // ===== HANDLE REDIRECTS IMMEDIATELY =====
-      // Check if response is a redirect (3xx status code) before reading body
+      // ===== HANDLE REDIRECTS - IMMEDIATELY WITHOUT BUFFERING BODY =====
       if (response.status >= 300 && response.status < 400 && locationHeader) {
         try {
           console.log(`[REDIRECT] Status: ${response.status}, Location: ${locationHeader}`);
@@ -568,11 +567,11 @@ app.all('/:proxyId*', async (req, res) => {
 
           console.log(`[REDIRECT] Redirect hostname: ${redirectUrl.hostname}, Origin hostname: ${originUrlObj.hostname}`);
 
-          // If redirect is to a DIFFERENT domain, allow external redirect
+          // If redirect is to a DIFFERENT domain, allow external redirect IMMEDIATELY
           if (redirectUrl.hostname !== originUrlObj.hostname) {
-            console.log(`[REDIRECT] External redirect detected - allowing to ${redirectUrl.hostname}`);
+            console.log(`[REDIRECT] External redirect detected - sending redirect immediately to ${redirectUrl.hostname}`);
             
-            // External redirect - send the redirect response with the original location
+            // External redirect - send the redirect response immediately WITHOUT reading body
             res.status(response.status);
             res.set('Location', locationHeader);
             
@@ -584,6 +583,7 @@ app.all('/:proxyId*', async (req, res) => {
               }
             });
             
+            // Send response immediately without buffering
             return res.end();
           } else {
             console.log(`[REDIRECT] Internal redirect detected - rewriting to stay on proxy`);
@@ -611,7 +611,7 @@ app.all('/:proxyId*', async (req, res) => {
           console.error('[REDIRECT] Error handling redirect:', e);
           console.error('[REDIRECT] Falling back to direct redirect response');
           
-          // If parsing fails, just pass through the redirect
+          // If parsing fails, just pass through the redirect immediately
           res.status(response.status);
           res.set('Location', locationHeader);
           
@@ -627,7 +627,7 @@ app.all('/:proxyId*', async (req, res) => {
       }
       // ===== END REDIRECT HANDLING =====
 
-      // Only read the body if it's NOT a redirect
+      // For non-redirect responses, buffer the body
       let body = await response.buffer();
 
       // Rewrite HTML if it's HTML content
