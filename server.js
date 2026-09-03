@@ -162,52 +162,24 @@ function rewriteHTML(html, proxyId, originUrl) {
   try {
     const originUrlObj = new URL(originUrl);
     const originDomain = originUrlObj.origin;
-    const originHostname = originUrlObj.hostname;
 
-    console.log(`[REWRITE] Rewriting HTML for proxy ${proxyId}, origin: ${originDomain}`);
-
-    // 1. Rewrite absolute URLs to origin (with and without protocols)
+    // Rewrite absolute URLs to origin
     html = html.replace(new RegExp(`href="${originDomain}`, 'g'), `href="/${proxyId}`);
     html = html.replace(new RegExp(`src="${originDomain}`, 'g'), `src="/${proxyId}`);
-    html = html.replace(new RegExp(`href='${originDomain}`, 'g'), `href='/${proxyId}`);
-    html = html.replace(new RegExp(`src='${originDomain}`, 'g'), `src='/${proxyId}`);
-    
-    // 2. Rewrite URLs with hostname only (http://hostname/path)
-    html = html.replace(new RegExp(`href="https?://${originHostname}`, 'g'), `href="/${proxyId}`);
-    html = html.replace(new RegExp(`src="https?://${originHostname}`, 'g'), `src="/${proxyId}`);
-    html = html.replace(new RegExp(`href='https?://${originHostname}`, 'g'), `href='/${proxyId}`);
-    html = html.replace(new RegExp(`src='https?://${originHostname}`, 'g'), `src='/${proxyId}`);
 
-    // 3. Rewrite root-relative URLs (but NOT already rewritten ones starting with /proxyId)
-    // Only rewrite if not already starting with /proxy
-    html = html.replace(/href="\/(?!\/|proxy)/g, `href="/${proxyId}/`);
-    html = html.replace(/src="\/(?!\/|proxy)/g, `src="/${proxyId}/`);
-    html = html.replace(/href='\/(?!\/|proxy)/g, `href='/${proxyId}/`);
-    html = html.replace(/src='\/(?!\/|proxy)/g, `src='/${proxyId}/`);
+    // Rewrite root-relative URLs
+    html = html.replace(/href="\/(?!\/)/g, `href="/${proxyId}/`);
+    html = html.replace(/src="\/(?!\/)/g, `src="/${proxyId}/`);
 
-    // 4. Rewrite form action attributes
-    html = html.replace(/action="\/(?!\/|proxy)/g, `action="/${proxyId}/`);
-    html = html.replace(/action='\/(?!\/|proxy)/g, `action='/${proxyId}/`);
+    // Rewrite action attributes in forms
+    html = html.replace(/action="\/(?!\/)/g, `action="/${proxyId}/`);
 
-    // 5. Rewrite data attributes (for AJAX, data-urls, etc)
-    html = html.replace(new RegExp(`data-[^=]*="/${originHostname}`, 'g'), `data-$&="/${proxyId}`);
-    html = html.replace(new RegExp(`data-[^=]*="https?://${originHostname}`, 'g'), `data-$&="/${proxyId}`);
-
-    // 6. Rewrite protocol-relative URLs
+    // Rewrite protocol-relative URLs
     html = html.replace(/href="\/\//g, 'href="https://');
     html = html.replace(/src="\/\//g, 'src="https://');
-    html = html.replace(/href='\/\//g, `href='https://`);
-    html = html.replace(/src='\/\//g, `src='https://`);
 
-    // 7. Rewrite onclick and other event handlers
-    html = html.replace(new RegExp(`onclick="[^"]*${originDomain}`, 'g'), (match) => {
-      return match.replace(originDomain, `/${proxyId}`);
-    });
-
-    console.log(`[REWRITE] HTML rewritten successfully`);
     return html;
   } catch (e) {
-    console.error(`[REWRITE] Error rewriting HTML:`, e);
     return html;
   }
 }
