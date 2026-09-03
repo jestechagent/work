@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Reverse Proxy Maker</title>
+  <title>Proxy Forge</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -146,7 +146,6 @@
     .message.success { background: rgba(0,200,83,0.1); color: var(--success); border: 1px solid var(--success); }
     .message.error { background: rgba(255,51,51,0.1); color: var(--danger); border: 1px solid var(--danger); }
 
-    /* Proxies list */
     .proxy-card {
       padding: 1.5rem;
       border-bottom: 1px solid var(--border);
@@ -183,7 +182,6 @@
     .empty-state { text-align: center; padding: 3rem 1.5rem; color: var(--text-light); }
     .empty-state-icon { font-size: 3rem; margin-bottom: 1rem; opacity: 0.5; }
 
-    /* Stats */
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -247,7 +245,6 @@
       <p class="tagline">Create lightweight reverse proxies instantly. No setup required.</p>
     </header>
 
-    <!-- Create Proxy Section -->
     <section>
       <h2>🔗 Create a Proxy</h2>
       <div class="input-group">
@@ -262,7 +259,7 @@
           <option value="D">D – Hash of URL + salt (12 hex chars)</option>
           <option value="E" selected>E – Crypto base64url (10 chars) ★ recommended</option>
         </select>
-        <div></div> <!-- placeholder -->
+        <div></div>
       </div>
       <div class="button-group">
         <button class="btn-primary" onclick="generateProxy()">Generate Link</button>
@@ -270,13 +267,11 @@
       <div id="message" class="message"></div>
     </section>
 
-    <!-- Proxies List Section -->
     <section class="proxies-section">
       <h2>📋 Your Proxies</h2>
       <div id="proxyList" class="loading"><div class="spinner"></div> Loading proxies...</div>
     </section>
 
-    <!-- Statistics Section -->
     <section class="stats-section">
       <div class="stats-header" style="display: flex; justify-content: space-between; align-items: center; padding: 2.5rem 2.5rem 0;">
         <h2>📊 Statistics</h2>
@@ -419,8 +414,8 @@
         const data = await response.json();
         if (response.ok) {
           showMessage('✅ All statistics have been reset.', 'success', 3000);
-          loadStats();  // refresh charts
-          loadProxies(); // refresh proxy cards (to show zeroed counts)
+          loadStats();
+          loadProxies();
         } else {
           showMessage('Failed to reset stats: ' + (data.error || 'unknown error'), 'error');
         }
