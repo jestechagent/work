@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 
 // ============================================================
 // 1.  RATE LIMITER (in-memory, per IP, 10 requests/minute)
+//     - Will be applied only to proxy and API routes
 // ============================================================
 const rateLimitStore = new Map();
 
@@ -49,10 +50,12 @@ setInterval(() => {
       rateLimitStore.delete(ip);
     }
   }
-}, 60000); // clean every minute
+}, 60000);
 
 // ============================================================
 // 2.  USER-AGENT FILTERING (block bots)
+//     Applied globally to all routes (including frontend)
+//     because we don't want bots scraping the admin page either.
 // ============================================================
 const BOT_UA_PATTERNS = [
   /curl/i, /python-requests/i, /headless/i, /phantomjs/i,
@@ -139,7 +142,7 @@ initializeDatabase().catch(err => {
 });
 
 // ============================================================
-// 4.  EXPRESS MIDDLEWARE
+// 4.  EXPRESS MIDDLEWARE (global: JSON, static, CORS, bot filter)
 // ============================================================
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
@@ -151,8 +154,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Apply rate limiter & bot filter to ALL routes
-app.use(rateLimiter);
+// Apply bot filter to EVERYTHING (including frontend) to block scrapers.
 app.use(botFilter);
 
 // ============================================================
@@ -250,8 +252,11 @@ function getCountryFromIP(ip) {
 }
 
 // ============================================================
-// 7.  API ENDPOINTS
+// 7.  API ENDPOINTS (with rate limiting)
 // ============================================================
+// Apply rate limiter to all API routes
+app.use('/api', rateLimiter);
+
 app.get('/api/proxies', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM proxies WHERE enabled = 1 ORDER BY created_at DESC');
@@ -404,12 +409,16 @@ app.post('/api/stats/reset', async (req, res) => {
 });
 
 // ============================================================
-// 8.  PROXY REDIRECT (with analytics)
+// 8.  PROXY REDIRECT (with rate limiting and analytics)
 // ============================================================
+// Apply rate limiter ONLY to proxy redirects
+app.use('/:proxyId', rateLimiter);
+
 app.all('/:proxyId*', async (req, res) => {
   const proxyId = req.params.proxyId;
   let path = req.params[0] || '';
 
+  // Don't interfere with API routes (they are handled above)
   if (proxyId.startsWith('api')) {
     return res.status(404).json({ error: 'Not found' });
   }
@@ -421,7 +430,7 @@ app.all('/:proxyId*', async (req, res) => {
       return res.status(404).json({ error: 'Proxy not found' });
     }
 
-    // Log analytics (non-blocking)
+    // ===== ANALYTICS TRACKING (with error handling) =====
     const ua = req.get('user-agent') || '';
     const ip = getClientIP(req);
     const device = getDeviceType(ua);
@@ -429,16 +438,18 @@ app.all('/:proxyId*', async (req, res) => {
     const country = getCountryFromIP(ip);
     const visitorId = 'visitor_' + Math.random().toString(36).substr(2, 9);
 
+    // Insert analytics record (non‑blocking, but we log errors)
     pool.query(
       `INSERT INTO analytics (proxy_id, visitor_id, ip_address, device, browser, country, path)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [proxyId, visitorId, ip, device, browser, country, path || '/']
-    ).catch(err => console.error('Analytics error:', err));
-
-    pool.query(
-      `UPDATE proxies SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = $1`,
-      [proxyId]
-    ).catch(err => console.error('Update error:', err));
+    ).then(() => {
+      // After analytics inserted, update proxy total_clicks
+      pool.query(
+        `UPDATE proxies SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = $1`,
+        [proxyId]
+      ).catch(err => console.error('Error updating proxy stats:', err));
+    }).catch(err => console.error('Error logging analytics:', err));
 
     // Build target URL
     const originUrlObj = new URL(proxy.origin_url);
@@ -455,6 +466,7 @@ app.all('/:proxyId*', async (req, res) => {
     }
 
     console.log(`[REDIRECT] ${proxyId} -> ${targetUrl.toString()}`);
+    // Send redirect immediately – analytics runs in background
     res.redirect(302, targetUrl.toString());
   } catch (err) {
     console.error('Redirect error:', err);
