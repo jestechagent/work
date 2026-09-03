@@ -97,6 +97,7 @@
       display: flex;
       gap: 1rem;
       margin-top: 1.5rem;
+      flex-wrap: wrap;
     }
     button {
       padding: 0.875rem 1.75rem;
@@ -124,6 +125,11 @@
       border: 2px solid var(--border);
     }
     .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-danger {
+      background: var(--danger);
+      color: white;
+    }
+    .btn-danger:hover { background: #cc0000; transform: translateY(-2px); }
     .btn-small { padding: 0.5rem 1rem; font-size: 0.85rem; border-radius: 4px; }
     .btn-copy { background: var(--accent); color: white; }
     .btn-copy:hover { background: #0052cc; }
@@ -272,7 +278,10 @@
 
     <!-- Statistics Section -->
     <section class="stats-section">
-      <div class="stats-header"><h2>📊 Statistics</h2></div>
+      <div class="stats-header" style="display: flex; justify-content: space-between; align-items: center; padding: 2.5rem 2.5rem 0;">
+        <h2>📊 Statistics</h2>
+        <button class="btn-danger btn-small" onclick="resetStats()">Reset All Stats</button>
+      </div>
       <div class="stats-grid">
         <div class="stat-card"><h3>Total Clicks</h3><p id="totalClicks">0</p></div>
         <div class="stat-card"><h3>Unique Visitors</h3><p id="uniqueVisitors">0</p></div>
@@ -400,6 +409,23 @@
         updateTrafficChart(stats.last_24h);
       } catch (error) {
         console.error('Failed to load stats:', error);
+      }
+    }
+
+    async function resetStats() {
+      if (!confirm('Are you sure you want to reset ALL statistics? This cannot be undone.')) return;
+      try {
+        const response = await fetch('/api/stats/reset', { method: 'POST' });
+        const data = await response.json();
+        if (response.ok) {
+          showMessage('✅ All statistics have been reset.', 'success', 3000);
+          loadStats();  // refresh charts
+          loadProxies(); // refresh proxy cards (to show zeroed counts)
+        } else {
+          showMessage('Failed to reset stats: ' + (data.error || 'unknown error'), 'error');
+        }
+      } catch (error) {
+        showMessage('Error: ' + error.message, 'error');
       }
     }
 
