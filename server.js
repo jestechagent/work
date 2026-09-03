@@ -463,7 +463,7 @@ app.post('/api/stats/:proxyId', async (req, res) => {
 });
 
 // ============================================================================
-// PROXY ROUTES - WITH REAL-TIME CLICK TRACKING
+// PROXY ROUTES - WITH REAL-TIME CLICK TRACKING & FAST REDIRECTS
 // ============================================================================
 
 app.all('/:proxyId*', async (req, res) => {
@@ -487,7 +487,7 @@ app.all('/:proxyId*', async (req, res) => {
       return res.status(404).json({ error: 'Proxy not found' });
     }
 
-    // ===== AUTOMATIC ANALYTICS TRACKING =====
+    // ===== AUTOMATIC ANALYTICS TRACKING (async, non-blocking) =====
     const userAgent = req.get('user-agent');
     const clientIP = getClientIP(req);
     const device = getDeviceType(userAgent);
@@ -512,69 +512,89 @@ app.all('/:proxyId*', async (req, res) => {
     ).catch(err => console.error('Error updating proxy stats:', err));
     // ===== END TRACKING =====
 
-    try {
-      // Build target URL - preserve full origin URL including paths
-      const originUrlObj = new URL(proxy.origin_url);
-      let targetUrl;
+    // Build target URL
+    const originUrlObj = new URL(proxy.origin_url);
+    let targetUrl;
 
-      if (!path || path === '/') {
-        // No additional path, use the full origin URL as-is
-        targetUrl = new URL(proxy.origin_url);
-      } else {
-        // Additional path provided, append it to origin path
-        const originPath = originUrlObj.pathname;
-        const targetPath = originPath + path;
-        targetUrl = new URL(targetPath, originUrlObj.origin);
+    if (!path || path === '/') {
+      targetUrl = new URL(proxy.origin_url);
+    } else {
+      const originPath = originUrlObj.pathname;
+      const targetPath = originPath + path;
+      targetUrl = new URL(targetPath, originUrlObj.origin);
+    }
+
+    // Forward query string
+    if (req.url.includes('?')) {
+      targetUrl.search = req.url.substring(req.url.indexOf('?'));
+    }
+
+    const method = req.method;
+    const headers = {
+      ...req.headers,
+      host: targetUrl.hostname,
+    };
+
+    delete headers['x-forwarded-for'];
+    delete headers['x-real-ip'];
+
+    const options = {
+      method,
+      headers,
+      redirect: 'manual', // Don't follow redirects automatically
+    };
+
+    if (['POST', 'PUT', 'PATCH'].includes(method)) {
+      if (req.get('content-type')) {
+        options.body = await getRawBody(req);
       }
+    }
 
-      // Forward query string
-      if (req.url.includes('?')) {
-        targetUrl.search = req.url.substring(req.url.indexOf('?'));
-      }
-
-      const method = req.method;
-      const headers = {
-        ...req.headers,
-        host: targetUrl.hostname,
-      };
-
-      delete headers['x-forwarded-for'];
-      delete headers['x-real-ip'];
-
-      const options = {
-        method,
-        headers,
-        redirect: 'manual',
-      };
-
-      if (['POST', 'PUT', 'PATCH'].includes(method)) {
-        if (req.get('content-type')) {
-          options.body = await getRawBody(req);
-        }
-      }
-
-      const response = await fetch(targetUrl.toString(), options);
-      const contentType = response.headers.get('content-type');
+    // ===== MAKE REQUEST AND HANDLE REDIRECTS IMMEDIATELY =====
+    const response = await fetch(targetUrl.toString(), options);
+    
+    // Check for redirect immediately - BEFORE reading the body
+    if (response.status >= 300 && response.status < 400) {
       const locationHeader = response.headers.get('location');
-
-      let body = await response.buffer();
-
-      // ===== HANDLE REDIRECTS =====
-      // Check if response is a redirect (3xx status code)
-      if (response.status >= 300 && response.status < 400 && locationHeader) {
+      
+      if (locationHeader) {
         try {
           console.log(`[REDIRECT] Status: ${response.status}, Location: ${locationHeader}`);
           
-          const redirectUrl = new URL(locationHeader, targetUrl.toString());
-          const originUrlObj = new URL(proxy.origin_url);
+          // Parse the redirect URL
+          let redirectUrl;
+          try {
+            redirectUrl = new URL(locationHeader, targetUrl.toString());
+          } catch (parseError) {
+            console.error(`[REDIRECT] Failed to parse redirect URL: ${locationHeader}`, parseError);
+            // If we can't parse it, just pass through the redirect
+            res.status(response.status);
+            res.set('Location', locationHeader);
+            // Copy other important headers
+            response.headers.forEach((value, name) => {
+              const lowerName = name.toLowerCase();
+              if (!['content-encoding', 'transfer-encoding', 'location'].includes(lowerName)) {
+                res.set(name, value);
+              }
+            });
+            // Don't consume the response body
+            return res.end();
+          }
 
-          console.log(`[REDIRECT] Redirect hostname: ${redirectUrl.hostname}, Origin hostname: ${originUrlObj.hostname}`);
+          // Get the origin domain from the proxy
+          const originHostname = originUrlObj.hostname;
+          const redirectHostname = redirectUrl.hostname;
 
-          // If redirect is to a DIFFERENT domain, allow external redirect
-          if (redirectUrl.hostname !== originUrlObj.hostname) {
-            console.log(`[REDIRECT] External redirect detected - allowing to ${redirectUrl.hostname}`);
+          console.log(`[REDIRECT] Redirect hostname: ${redirectHostname}, Origin hostname: ${originHostname}`);
+
+          // Check if redirect is to a different domain
+          const isExternalRedirect = redirectHostname !== originHostname;
+
+          if (isExternalRedirect) {
+            // EXTERNAL REDIRECT - Allow it to go to the external site
+            console.log(`[REDIRECT] External redirect detected - allowing to ${redirectHostname}`);
             
-            // External redirect - send the redirect response with the original location
+            // Send the redirect response with the original location
             res.status(response.status);
             res.set('Location', locationHeader);
             
@@ -586,12 +606,14 @@ app.all('/:proxyId*', async (req, res) => {
               }
             });
             
+            // Don't consume the response body - redirect immediately
             return res.end();
           } else {
+            // INTERNAL REDIRECT - Stay on the proxy
             console.log(`[REDIRECT] Internal redirect detected - rewriting to stay on proxy`);
             
-            // Internal redirect - rewrite to go through proxy
-            const internalPath = redirectUrl.pathname + redirectUrl.search;
+            // Rewrite to go through proxy
+            const internalPath = redirectUrl.pathname + redirectUrl.search + redirectUrl.hash;
             const rewrittenLocation = `/${proxyId}${internalPath}`;
             
             console.log(`[REDIRECT] Rewritten location: ${rewrittenLocation}`);
@@ -607,54 +629,51 @@ app.all('/:proxyId*', async (req, res) => {
               }
             });
             
+            // Don't consume the response body - redirect immediately
             return res.end();
           }
         } catch (e) {
           console.error('[REDIRECT] Error handling redirect:', e);
-          console.error('[REDIRECT] Falling back to direct redirect response');
-          
-          // If parsing fails, just pass through the redirect
+          // Fallback: pass through the redirect
           res.status(response.status);
           res.set('Location', locationHeader);
-          
           response.headers.forEach((value, name) => {
             const lowerName = name.toLowerCase();
             if (!['content-encoding', 'transfer-encoding', 'location'].includes(lowerName)) {
               res.set(name, value);
             }
           });
-          
           return res.end();
         }
       }
-      // ===== END REDIRECT HANDLING =====
-
-      // Rewrite HTML if it's HTML content
-      if (contentType && contentType.includes('text/html')) {
-        let html = body.toString('utf-8');
-        html = rewriteHTML(html, proxyId, proxy.origin_url);
-        body = Buffer.from(html, 'utf-8');
-      }
-
-      // Copy response headers
-      response.headers.forEach((value, name) => {
-        // Skip problematic headers
-        if (!['content-encoding', 'transfer-encoding'].includes(name.toLowerCase())) {
-          res.set(name, value);
-        }
-      });
-
-      res.status(response.status).send(body);
-    } catch (error) {
-      console.error('Proxy error:', error);
-      res.status(502).json({
-        error: 'Failed to proxy request',
-        message: error.message,
-      });
     }
-  } catch (err) {
-    console.error('Error handling proxy request:', err);
-    res.status(500).json({ error: 'Internal server error' });
+
+    // ===== NOT A REDIRECT - Process the response body =====
+    const contentType = response.headers.get('content-type');
+    let body = await response.buffer();
+
+    // Rewrite HTML if it's HTML content
+    if (contentType && contentType.includes('text/html')) {
+      let html = body.toString('utf-8');
+      html = rewriteHTML(html, proxyId, proxy.origin_url);
+      body = Buffer.from(html, 'utf-8');
+    }
+
+    // Copy response headers
+    response.headers.forEach((value, name) => {
+      // Skip problematic headers
+      if (!['content-encoding', 'transfer-encoding'].includes(name.toLowerCase())) {
+        res.set(name, value);
+      }
+    });
+
+    res.status(response.status).send(body);
+  } catch (error) {
+    console.error('Proxy error:', error);
+    res.status(502).json({
+      error: 'Failed to proxy request',
+      message: error.message,
+    });
   }
 });
 
