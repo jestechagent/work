@@ -322,45 +322,68 @@ app.delete('/api/proxies/:id', async (req, res) => {
   }
 });
 
+// ===== FIXED STATISTICS ENDPOINT =====
 app.get('/api/stats', async (req, res) => {
   try {
-    const click = await pool.query(
-      `SELECT COUNT(*) as total_clicks FROM analytics WHERE timestamp > NOW() - INTERVAL '24 hours'`
+    // 1. Total clicks: sum of total_clicks from all proxies (or all-time analytics count)
+    const totalClicksResult = await pool.query(
+      `SELECT SUM(total_clicks) as total_clicks FROM proxies WHERE enabled = 1`
     );
-    const visitors = await pool.query(
-      `SELECT COUNT(DISTINCT visitor_id) as unique_visitors FROM analytics WHERE timestamp > NOW() - INTERVAL '24 hours'`
+    const totalClicks = parseInt(totalClicksResult.rows[0]?.total_clicks) || 0;
+
+    // 2. Unique visitors: count distinct visitor_id from analytics (all time)
+    const uniqueVisitorsResult = await pool.query(
+      `SELECT COUNT(DISTINCT visitor_id) as unique_visitors FROM analytics`
     );
-    const country = await pool.query(
-      `SELECT country, COUNT(*) as count FROM analytics WHERE country IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours' GROUP BY country ORDER BY count DESC LIMIT 10`
+    const uniqueVisitors = parseInt(uniqueVisitorsResult.rows[0]?.unique_visitors) || 0;
+
+    // 3. Last 24h analytics for charts (unchanged)
+    const countryResult = await pool.query(
+      `SELECT country, COUNT(*) as count FROM analytics 
+       WHERE country IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours' 
+       GROUP BY country ORDER BY count DESC LIMIT 10`
     );
-    const device = await pool.query(
-      `SELECT device, COUNT(*) as count FROM analytics WHERE device IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours' GROUP BY device ORDER BY count DESC`
+    const deviceResult = await pool.query(
+      `SELECT device, COUNT(*) as count FROM analytics 
+       WHERE device IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours' 
+       GROUP BY device ORDER BY count DESC`
     );
-    const browser = await pool.query(
-      `SELECT browser, COUNT(*) as count FROM analytics WHERE browser IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours' GROUP BY browser ORDER BY count DESC`
+    const browserResult = await pool.query(
+      `SELECT browser, COUNT(*) as count FROM analytics 
+       WHERE browser IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours' 
+       GROUP BY browser ORDER BY count DESC`
     );
-    const traffic = await pool.query(
-      `SELECT EXTRACT(HOUR FROM timestamp)::int as hour, COUNT(*) as clicks FROM analytics WHERE timestamp > NOW() - INTERVAL '24 hours' GROUP BY EXTRACT(HOUR FROM timestamp) ORDER BY hour`
+    const trafficResult = await pool.query(
+      `SELECT EXTRACT(HOUR FROM timestamp)::int as hour, COUNT(*) as clicks 
+       FROM analytics 
+       WHERE timestamp > NOW() - INTERVAL '24 hours' 
+       GROUP BY EXTRACT(HOUR FROM timestamp) 
+       ORDER BY hour`
     );
 
+    // Build chart data
     const by_country = {};
-    country.rows.forEach(r => by_country[r.country] = parseInt(r.count));
+    countryResult.rows.forEach(r => by_country[r.country] = parseInt(r.count));
     const by_device = {};
-    device.rows.forEach(r => by_device[r.device] = parseInt(r.count));
+    deviceResult.rows.forEach(r => by_device[r.device] = parseInt(r.count));
     const by_browser = {};
-    browser.rows.forEach(r => by_browser[r.browser] = parseInt(r.count));
+    browserResult.rows.forEach(r => by_browser[r.browser] = parseInt(r.count));
     const last24h = Array.from({ length: 24 }, (_, i) => ({ hour: i, clicks: 0 }));
-    traffic.rows.forEach(r => { const h = r.hour; if (h >= 0 && h < 24) last24h[h].clicks = parseInt(r.clicks); });
+    trafficResult.rows.forEach(r => {
+      const h = r.hour;
+      if (h >= 0 && h < 24) last24h[h].clicks = parseInt(r.clicks);
+    });
 
     res.json({
-      total_clicks: parseInt(click.rows[0].total_clicks) || 0,
-      unique_visitors: parseInt(visitors.rows[0].unique_visitors) || 0,
+      total_clicks: totalClicks,
+      unique_visitors: uniqueVisitors,
       by_country,
       by_device,
       by_browser,
       last_24h,
     });
   } catch (err) {
+    console.error('Stats error:', err);
     res.status(500).json({ error: err.message });
   }
 });
