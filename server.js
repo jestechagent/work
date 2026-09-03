@@ -559,22 +559,45 @@ app.all('/:proxyId*', async (req, res) => {
 
       let body = await response.buffer();
 
-      // ===== HANDLE REDIRECTS =====
+      // ===== HANDLE REDIRECTS - FIXED VERSION =====
       // Check if response is a redirect (3xx status code)
       if (response.status >= 300 && response.status < 400 && locationHeader) {
         try {
           console.log(`[REDIRECT] Status: ${response.status}, Location: ${locationHeader}`);
           
-          const redirectUrl = new URL(locationHeader, targetUrl.toString());
+          // Parse the redirect URL
+          let redirectUrl;
+          try {
+            redirectUrl = new URL(locationHeader, targetUrl.toString());
+          } catch (parseError) {
+            console.error(`[REDIRECT] Failed to parse redirect URL: ${locationHeader}`, parseError);
+            // If we can't parse it, just pass through the redirect
+            res.status(response.status);
+            res.set('Location', locationHeader);
+            response.headers.forEach((value, name) => {
+              const lowerName = name.toLowerCase();
+              if (!['content-encoding', 'transfer-encoding', 'location'].includes(lowerName)) {
+                res.set(name, value);
+              }
+            });
+            return res.end();
+          }
+
+          // Get the origin domain from the proxy
           const originUrlObj = new URL(proxy.origin_url);
+          const originHostname = originUrlObj.hostname;
+          const redirectHostname = redirectUrl.hostname;
 
-          console.log(`[REDIRECT] Redirect hostname: ${redirectUrl.hostname}, Origin hostname: ${originUrlObj.hostname}`);
+          console.log(`[REDIRECT] Redirect hostname: ${redirectHostname}, Origin hostname: ${originHostname}`);
 
-          // If redirect is to a DIFFERENT domain, allow external redirect
-          if (redirectUrl.hostname !== originUrlObj.hostname) {
-            console.log(`[REDIRECT] External redirect detected - allowing to ${redirectUrl.hostname}`);
+          // CRITICAL FIX: Check if redirect is to a different domain
+          const isExternalRedirect = redirectHostname !== originHostname;
+
+          if (isExternalRedirect) {
+            // EXTERNAL REDIRECT - Allow it to go to the external site
+            console.log(`[REDIRECT] External redirect detected - allowing to ${redirectHostname}`);
             
-            // External redirect - send the redirect response with the original location
+            // Send the redirect response with the original location
             res.status(response.status);
             res.set('Location', locationHeader);
             
@@ -588,10 +611,11 @@ app.all('/:proxyId*', async (req, res) => {
             
             return res.end();
           } else {
+            // INTERNAL REDIRECT - Stay on the proxy
             console.log(`[REDIRECT] Internal redirect detected - rewriting to stay on proxy`);
             
-            // Internal redirect - rewrite to go through proxy
-            const internalPath = redirectUrl.pathname + redirectUrl.search;
+            // Rewrite to go through proxy - preserve the path and query string
+            const internalPath = redirectUrl.pathname + redirectUrl.search + redirectUrl.hash;
             const rewrittenLocation = `/${proxyId}${internalPath}`;
             
             console.log(`[REDIRECT] Rewritten location: ${rewrittenLocation}`);
