@@ -23,13 +23,10 @@ pool.on('error', (err) => {
   process.exit(-1);
 });
 
-// Initialize database tables
 async function initializeDatabase() {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // Create proxies table
     await client.query(`
       CREATE TABLE IF NOT EXISTS proxies (
         id TEXT PRIMARY KEY,
@@ -42,8 +39,6 @@ async function initializeDatabase() {
         enabled INTEGER DEFAULT 1
       )
     `);
-
-    // Create analytics table
     await client.query(`
       CREATE TABLE IF NOT EXISTS analytics (
         id SERIAL PRIMARY KEY,
@@ -59,12 +54,9 @@ async function initializeDatabase() {
         FOREIGN KEY(proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
       )
     `);
-
-    // Create index for better query performance
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_analytics_proxy_id ON analytics(proxy_id)
     `);
-
     await client.query('COMMIT');
     console.log('Database tables initialized successfully');
   } catch (err) {
@@ -76,7 +68,6 @@ async function initializeDatabase() {
   }
 }
 
-// Initialize database on startup
 initializeDatabase().catch(err => {
   console.error('Failed to initialize database:', err);
   process.exit(-1);
@@ -90,7 +81,6 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
-// Add CORS headers
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
@@ -113,7 +103,6 @@ function generateSlug(length = 8) {
 function validateURL(urlString) {
   try {
     const url = new URL(urlString);
-    // Block private/internal IPs
     const hostname = url.hostname;
     if (
       hostname === 'localhost' ||
@@ -156,6 +145,21 @@ function getCountryFromIP(ipAddress) {
   }
 }
 
+function getClientIP(req) {
+  return (
+    req.headers['x-forwarded-for'] ||
+    req.headers['x-real-ip'] ||
+    req.connection.remoteAddress ||
+    req.socket.remoteAddress ||
+    req.ip ||
+    '0.0.0.0'
+  ).split(',')[0].trim();
+}
+
+// ============================================================================
+// IMPROVED HTML REWRITING (with meta refresh & JS redirect support)
+// ============================================================================
+
 function rewriteHTML(html, proxyId, originUrl) {
   if (!html || typeof html !== 'string') return html;
 
@@ -179,7 +183,6 @@ function rewriteHTML(html, proxyId, originUrl) {
     html = html.replace(new RegExp(`src='https?://${originHostname}`, 'g'), `src='/${proxyId}`);
 
     // 3. Rewrite root-relative URLs (but NOT already rewritten ones starting with /proxyId)
-    // Only rewrite if not already starting with /proxy
     html = html.replace(/href="\/(?!\/|proxy)/g, `href="/${proxyId}/`);
     html = html.replace(/src="\/(?!\/|proxy)/g, `src="/${proxyId}/`);
     html = html.replace(/href='\/(?!\/|proxy)/g, `href='/${proxyId}/`);
@@ -204,6 +207,65 @@ function rewriteHTML(html, proxyId, originUrl) {
       return match.replace(originDomain, `/${proxyId}`);
     });
 
+    // ========== NEW: Rewrite META REFRESH tags ==========
+    // Example: <meta http-equiv="refresh" content="0;url=https://example.com">
+    // We need to decide if the URL is external or internal.
+    html = html.replace(/<meta\s+http-equiv=["']refresh["']\s+content=["']([^"']*)["']/gi, (match, content) => {
+      // Extract the URL part after "url=" (case-insensitive)
+      const urlMatch = content.match(/url\s*=\s*([^;]+)/i);
+      if (!urlMatch) return match; // no URL, leave as is
+
+      let redirectUrl = urlMatch[1].trim();
+      // Remove quotes if present
+      redirectUrl = redirectUrl.replace(/^["']|["']$/g, '');
+
+      try {
+        // Resolve relative URL against the origin URL
+        const resolved = new URL(redirectUrl, originUrl);
+        const isExternal = resolved.hostname !== originHostname;
+
+        if (isExternal) {
+          // External redirect: keep the original URL (browser will go there directly)
+          console.log(`[META] External meta refresh detected, keeping URL: ${redirectUrl}`);
+          return match; // no change
+        } else {
+          // Internal redirect: rewrite to proxy path
+          const newPath = resolved.pathname + resolved.search + resolved.hash;
+          const proxyPath = `/${proxyId}${newPath}`;
+          const newContent = content.replace(/url\s*=\s*[^;]+/i, `url=${proxyPath}`);
+          console.log(`[META] Rewritten meta refresh to: ${proxyPath}`);
+          return match.replace(content, newContent);
+        }
+      } catch (e) {
+        // If URL parsing fails, leave as is
+        console.error(`[META] Error parsing URL: ${redirectUrl}`, e);
+        return match;
+      }
+    });
+
+    // ========== NEW: Basic JavaScript redirect rewriting ==========
+    // This is a best-effort attempt to catch window.location and location.href assignments
+    // We look for patterns like: window.location = "http://...", location.href = "...", etc.
+    // We'll only rewrite if the URL is internal (same hostname) and not already proxied.
+    html = html.replace(/(window\.location|location\.href|location\.replace)\s*=\s*["']([^"']*)["']/gi, (match, func, url) => {
+      try {
+        const resolved = new URL(url, originUrl);
+        const isExternal = resolved.hostname !== originHostname;
+        if (isExternal) {
+          // External: leave as is (browser goes to external)
+          return match;
+        } else {
+          // Internal: rewrite to proxy path
+          const newPath = resolved.pathname + resolved.search + resolved.hash;
+          const proxyPath = `/${proxyId}${newPath}`;
+          console.log(`[JS] Rewritten JavaScript redirect to: ${proxyPath}`);
+          return match.replace(url, proxyPath);
+        }
+      } catch (e) {
+        return match;
+      }
+    });
+
     console.log(`[REWRITE] HTML rewritten successfully`);
     return html;
   } catch (e) {
@@ -212,22 +274,10 @@ function rewriteHTML(html, proxyId, originUrl) {
   }
 }
 
-function getClientIP(req) {
-  return (
-    req.headers['x-forwarded-for'] ||
-    req.headers['x-real-ip'] ||
-    req.connection.remoteAddress ||
-    req.socket.remoteAddress ||
-    req.ip ||
-    '0.0.0.0'
-  ).split(',')[0].trim();
-}
-
 // ============================================================================
-// API ENDPOINTS
+// API ENDPOINTS (unchanged)
 // ============================================================================
 
-// Get all proxies
 app.get('/api/proxies', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM proxies WHERE enabled = 1 ORDER BY created_at DESC');
@@ -238,19 +288,14 @@ app.get('/api/proxies', async (req, res) => {
   }
 });
 
-// Create new proxy
 app.post('/api/proxies', async (req, res) => {
   const { origin_url, name } = req.body;
-
   if (!origin_url || !name) {
     return res.status(400).json({ error: 'Missing origin_url or name. Please enter both URL and proxy name.' });
   }
 
-  // Validate URL format
   try {
     const urlObj = new URL(origin_url.startsWith('http') ? origin_url : `https://${origin_url}`);
-    
-    // Check for private IPs
     const hostname = urlObj.hostname;
     if (
       hostname === 'localhost' ||
@@ -272,7 +317,6 @@ app.post('/api/proxies', async (req, res) => {
   const id = generateSlug();
   const originUrl = origin_url.startsWith('http') ? origin_url : `https://${origin_url}`;
 
-  // Test if URL is reachable before creating proxy
   try {
     console.log(`Testing connectivity to: ${originUrl}`);
     const testResponse = await fetch(originUrl, { 
@@ -280,9 +324,7 @@ app.post('/api/proxies', async (req, res) => {
       timeout: 8000,
       redirect: 'follow'
     });
-    
     console.log(`Response from ${originUrl}: ${testResponse.status} ${testResponse.statusText}`);
-    
     if (testResponse.status === 404) {
       return res.status(400).json({ 
         error: `URL returned 404 Not Found. Please verify the path is correct.`,
@@ -290,14 +332,12 @@ app.post('/api/proxies', async (req, res) => {
         hint: 'The server responded with 404. Check if the exact path exists on the server.'
       });
     }
-    
     if (testResponse.status >= 500) {
       return res.status(400).json({ 
         error: `Server error (${testResponse.status}). The target server returned an error.`,
         details: `URL: ${originUrl}`
       });
     }
-    
     console.log(`✅ URL is reachable: ${originUrl}`);
   } catch (testErr) {
     console.error(`❌ Cannot reach URL: ${originUrl}`, testErr.message);
@@ -319,7 +359,6 @@ app.post('/api/proxies', async (req, res) => {
       'INSERT INTO proxies (id, name, origin_url) VALUES ($1, $2, $3)',
       [id, name, originUrl]
     );
-
     const proxyUrl = `https://${req.get('host')}/${id}`;
     res.json({ id, proxy_url: proxyUrl, name, origin_url: originUrl });
   } catch (err) {
@@ -328,10 +367,8 @@ app.post('/api/proxies', async (req, res) => {
   }
 });
 
-// Delete proxy
 app.delete('/api/proxies/:id', async (req, res) => {
   const { id } = req.params;
-
   try {
     await pool.query('UPDATE proxies SET enabled = 0 WHERE id = $1', [id]);
     res.json({ success: true });
@@ -341,43 +378,31 @@ app.delete('/api/proxies/:id', async (req, res) => {
   }
 });
 
-// Get global statistics
 app.get('/api/stats', async (req, res) => {
   try {
-    // Total clicks in last 24 hours
     const clickResult = await pool.query(
       `SELECT COUNT(*) as total_clicks FROM analytics
        WHERE timestamp > NOW() - INTERVAL '24 hours'`
     );
-
-    // Unique visitors in last 24 hours
     const visitorResult = await pool.query(
       `SELECT COUNT(DISTINCT visitor_id) as unique_visitors FROM analytics
        WHERE timestamp > NOW() - INTERVAL '24 hours'`
     );
-
-    // Top 10 countries in last 24 hours
     const countryResult = await pool.query(
       `SELECT country, COUNT(*) as count FROM analytics
        WHERE country IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours'
        GROUP BY country ORDER BY count DESC LIMIT 10`
     );
-
-    // Devices in last 24 hours
     const deviceResult = await pool.query(
       `SELECT device, COUNT(*) as count FROM analytics
        WHERE device IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours'
        GROUP BY device ORDER BY count DESC`
     );
-
-    // Browsers in last 24 hours
     const browserResult = await pool.query(
       `SELECT browser, COUNT(*) as count FROM analytics
        WHERE browser IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours'
        GROUP BY browser ORDER BY count DESC`
     );
-
-    // Traffic by hour in last 24 hours
     const trafficResult = await pool.query(
       `SELECT EXTRACT(HOUR FROM timestamp)::int as hour, COUNT(*) as clicks
        FROM analytics
@@ -386,28 +411,15 @@ app.get('/api/stats', async (req, res) => {
        ORDER BY hour`
     );
 
-    // Build response objects
     const by_country = {};
-    countryResult.rows.forEach((row) => {
-      by_country[row.country] = parseInt(row.count);
-    });
-
+    countryResult.rows.forEach((row) => { by_country[row.country] = parseInt(row.count); });
     const by_device = {};
-    deviceResult.rows.forEach((row) => {
-      by_device[row.device] = parseInt(row.count);
-    });
-
+    deviceResult.rows.forEach((row) => { by_device[row.device] = parseInt(row.count); });
     const by_browser = {};
-    browserResult.rows.forEach((row) => {
-      by_browser[row.browser] = parseInt(row.count);
-    });
+    browserResult.rows.forEach((row) => { by_browser[row.browser] = parseInt(row.count); });
 
-    // Generate last 24h traffic data
     const last24h = [];
-    for (let i = 0; i < 24; i++) {
-      last24h.push({ hour: i, clicks: 0 });
-    }
-
+    for (let i = 0; i < 24; i++) last24h.push({ hour: i, clicks: 0 });
     trafficResult.rows.forEach((row) => {
       const hourIndex = row.hour;
       if (hourIndex >= 0 && hourIndex < 24) {
@@ -421,7 +433,7 @@ app.get('/api/stats', async (req, res) => {
       by_country,
       by_device,
       by_browser,
-      last_24h: last24h,
+      last_24h,
     });
   } catch (err) {
     console.error('Error fetching stats:', err);
@@ -429,7 +441,6 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-// Record analytics for a proxy
 app.post('/api/stats/:proxyId', async (req, res) => {
   const { proxyId } = req.params;
   const { visitor_id } = req.body;
@@ -446,15 +457,12 @@ app.post('/api/stats/:proxyId', async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [proxyId, visitor_id, clientIP, device, browser, country]
     );
-
-    // Update proxy stats
     await pool.query(
       `UPDATE proxies 
        SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP
        WHERE id = $1`,
       [proxyId]
     );
-
     res.json({ success: true });
   } catch (err) {
     console.error('Error recording analytics:', err);
@@ -463,14 +471,13 @@ app.post('/api/stats/:proxyId', async (req, res) => {
 });
 
 // ============================================================================
-// PROXY ROUTES - WITH REAL-TIME CLICK TRACKING & FAST REDIRECTS
+// PROXY ROUTES - FAST REDIRECT HANDLING
 // ============================================================================
 
 app.all('/:proxyId*', async (req, res) => {
   const proxyId = req.params.proxyId;
   let path = req.params[0] || '';
 
-  // Don't proxy API calls
   if (proxyId.startsWith('api')) {
     return res.status(404).json({ error: 'Not found' });
   }
@@ -480,14 +487,12 @@ app.all('/:proxyId*', async (req, res) => {
       'SELECT * FROM proxies WHERE id = $1 AND enabled = 1',
       [proxyId]
     );
-
     const proxy = proxyResult.rows[0];
-
     if (!proxy) {
       return res.status(404).json({ error: 'Proxy not found' });
     }
 
-    // ===== AUTOMATIC ANALYTICS TRACKING (async, non-blocking) =====
+    // Analytics (non-blocking)
     const userAgent = req.get('user-agent');
     const clientIP = getClientIP(req);
     const device = getDeviceType(userAgent);
@@ -495,7 +500,6 @@ app.all('/:proxyId*', async (req, res) => {
     const country = getCountryFromIP(clientIP);
     const visitorId = 'visitor_' + Math.random().toString(36).substr(2, 9);
 
-    // Insert analytics record (non-blocking)
     pool.query(
       `INSERT INTO analytics 
        (proxy_id, visitor_id, ip_address, device, browser, country, path)
@@ -503,19 +507,16 @@ app.all('/:proxyId*', async (req, res) => {
       [proxyId, visitorId, clientIP, device, browser, country, path || '/']
     ).catch(err => console.error('Error logging analytics:', err));
 
-    // Update proxy stats (non-blocking)
     pool.query(
       `UPDATE proxies 
        SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP
        WHERE id = $1`,
       [proxyId]
     ).catch(err => console.error('Error updating proxy stats:', err));
-    // ===== END TRACKING =====
 
     // Build target URL
     const originUrlObj = new URL(proxy.origin_url);
     let targetUrl;
-
     if (!path || path === '/') {
       targetUrl = new URL(proxy.origin_url);
     } else {
@@ -524,7 +525,6 @@ app.all('/:proxyId*', async (req, res) => {
       targetUrl = new URL(targetPath, originUrlObj.origin);
     }
 
-    // Forward query string
     if (req.url.includes('?')) {
       targetUrl.search = req.url.substring(req.url.indexOf('?'));
     }
@@ -534,14 +534,13 @@ app.all('/:proxyId*', async (req, res) => {
       ...req.headers,
       host: targetUrl.hostname,
     };
-
     delete headers['x-forwarded-for'];
     delete headers['x-real-ip'];
 
     const options = {
       method,
       headers,
-      redirect: 'manual', // Don't follow redirects automatically
+      redirect: 'manual',
     };
 
     if (['POST', 'PUT', 'PATCH'].includes(method)) {
@@ -550,91 +549,60 @@ app.all('/:proxyId*', async (req, res) => {
       }
     }
 
-    // ===== MAKE REQUEST AND HANDLE REDIRECTS IMMEDIATELY =====
+    // Make request
     const response = await fetch(targetUrl.toString(), options);
-    
-    // Check for redirect immediately - BEFORE reading the body
+
+    // ===== HANDLE HTTP REDIRECTS IMMEDIATELY (no body read) =====
     if (response.status >= 300 && response.status < 400) {
       const locationHeader = response.headers.get('location');
-      
       if (locationHeader) {
         try {
           console.log(`[REDIRECT] Status: ${response.status}, Location: ${locationHeader}`);
-          
-          // Parse the redirect URL
           let redirectUrl;
           try {
             redirectUrl = new URL(locationHeader, targetUrl.toString());
           } catch (parseError) {
             console.error(`[REDIRECT] Failed to parse redirect URL: ${locationHeader}`, parseError);
-            // If we can't parse it, just pass through the redirect
+            // Pass through
             res.status(response.status);
             res.set('Location', locationHeader);
-            // Copy other important headers
             response.headers.forEach((value, name) => {
               const lowerName = name.toLowerCase();
               if (!['content-encoding', 'transfer-encoding', 'location'].includes(lowerName)) {
                 res.set(name, value);
               }
             });
-            // Don't consume the response body
             return res.end();
           }
 
-          // Get the origin domain from the proxy
           const originHostname = originUrlObj.hostname;
           const redirectHostname = redirectUrl.hostname;
+          const isExternal = redirectHostname !== originHostname;
 
-          console.log(`[REDIRECT] Redirect hostname: ${redirectHostname}, Origin hostname: ${originHostname}`);
-
-          // Check if redirect is to a different domain
-          const isExternalRedirect = redirectHostname !== originHostname;
-
-          if (isExternalRedirect) {
-            // EXTERNAL REDIRECT - Allow it to go to the external site
-            console.log(`[REDIRECT] External redirect detected - allowing to ${redirectHostname}`);
-            
-            // Send the redirect response with the original location
+          if (isExternal) {
+            console.log(`[REDIRECT] External redirect -> ${redirectHostname}`);
             res.status(response.status);
             res.set('Location', locationHeader);
-            
-            // Copy other important headers
-            response.headers.forEach((value, name) => {
-              const lowerName = name.toLowerCase();
-              if (!['content-encoding', 'transfer-encoding', 'location'].includes(lowerName)) {
-                res.set(name, value);
-              }
-            });
-            
-            // Don't consume the response body - redirect immediately
-            return res.end();
           } else {
-            // INTERNAL REDIRECT - Stay on the proxy
-            console.log(`[REDIRECT] Internal redirect detected - rewriting to stay on proxy`);
-            
-            // Rewrite to go through proxy
+            console.log(`[REDIRECT] Internal redirect -> rewriting to /${proxyId}${redirectUrl.pathname}${redirectUrl.search}${redirectUrl.hash}`);
             const internalPath = redirectUrl.pathname + redirectUrl.search + redirectUrl.hash;
             const rewrittenLocation = `/${proxyId}${internalPath}`;
-            
-            console.log(`[REDIRECT] Rewritten location: ${rewrittenLocation}`);
-            
             res.status(response.status);
             res.set('Location', rewrittenLocation);
-            
-            // Copy other important headers
-            response.headers.forEach((value, name) => {
-              const lowerName = name.toLowerCase();
-              if (!['content-encoding', 'transfer-encoding', 'location'].includes(lowerName)) {
-                res.set(name, value);
-              }
-            });
-            
-            // Don't consume the response body - redirect immediately
-            return res.end();
           }
+
+          // Copy other headers
+          response.headers.forEach((value, name) => {
+            const lowerName = name.toLowerCase();
+            if (!['content-encoding', 'transfer-encoding', 'location'].includes(lowerName)) {
+              res.set(name, value);
+            }
+          });
+
+          return res.end(); // immediate redirect
         } catch (e) {
           console.error('[REDIRECT] Error handling redirect:', e);
-          // Fallback: pass through the redirect
+          // Fallback
           res.status(response.status);
           res.set('Location', locationHeader);
           response.headers.forEach((value, name) => {
@@ -648,20 +616,17 @@ app.all('/:proxyId*', async (req, res) => {
       }
     }
 
-    // ===== NOT A REDIRECT - Process the response body =====
+    // ===== NOT A REDIRECT - Process body =====
     const contentType = response.headers.get('content-type');
     let body = await response.buffer();
 
-    // Rewrite HTML if it's HTML content
     if (contentType && contentType.includes('text/html')) {
       let html = body.toString('utf-8');
       html = rewriteHTML(html, proxyId, proxy.origin_url);
       body = Buffer.from(html, 'utf-8');
     }
 
-    // Copy response headers
     response.headers.forEach((value, name) => {
-      // Skip problematic headers
       if (!['content-encoding', 'transfer-encoding'].includes(name.toLowerCase())) {
         res.set(name, value);
       }
@@ -687,7 +652,7 @@ function getRawBody(req) {
   });
 }
 
-// Serve index.html for root
+// Serve index.html
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
@@ -701,13 +666,11 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error', message: err.message });
 });
 
-// FIX FOR RENDER: Listen on 0.0.0.0
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Reverse Proxy Server running on port ${PORT}`);
   console.log(`Server is accessible on 0.0.0.0:${PORT}`);
 });
 
-// Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('Shutting down gracefully...');
   await pool.end();
