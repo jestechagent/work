@@ -4,8 +4,6 @@ const fetch = require('node-fetch');
 const geoip = require('geoip-lite');
 const path = require('path');
 const crypto = require('crypto');
-
-// ----- New: rate limiting & bot detection -----
 const rateLimit = require('express-rate-limit');
 
 const app = express();
@@ -25,7 +23,6 @@ pool.on('error', (err) => {
   process.exit(-1);
 });
 
-// Initialize database tables
 async function initializeDatabase() {
   const client = await pool.connect();
   try {
@@ -84,26 +81,25 @@ initializeDatabase().catch(err => {
 // MIDDLEWARE
 // ============================================================================
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(express.static('public'));
 
-// CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   next();
 });
 
-// ----- 1. RATE LIMITING: 10 requests per minute per IP -----
+// ----- 1. RATE LIMITING (10 per minute per IP) -----
 const limiter = rateLimit({
-  windowMs: 60 * 1000,          // 1 minute
+  windowMs: 60 * 1000,
   max: 10,
   message: 'Too many requests from this IP, please slow down.',
   standardHeaders: true,
   legacyHeaders: false,
 });
-app.use(limiter);  // applies to all routes
+app.use(limiter);
 
 // ----- 2. USER-AGENT FILTERING (block bots) -----
 const BOT_UA_PATTERNS = [
@@ -129,10 +125,10 @@ app.use((req, res, next) => {
 });
 
 // ============================================================================
-// UTILITY FUNCTIONS (Slug generation methods A–E)
+// UTILITY FUNCTIONS - Slug Generators (A to E)
 // ============================================================================
 
-// Method A: random alphanumeric (a-z0-9) length 10
+// A: random alphanumeric (a-z0-9) length 10
 function generateSlugA() {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let slug = '';
@@ -142,25 +138,23 @@ function generateSlugA() {
   return slug;
 }
 
-// Method B: base36 encoding of cryptographically random bytes
+// B: base36 encoding of cryptographically random bytes
 function generateSlugB() {
-  const bytes = crypto.randomBytes(8); // 64-bit
+  const bytes = crypto.randomBytes(8);
   const num = BigInt('0x' + bytes.toString('hex'));
-  return num.toString(36).padStart(10, '0'); // length 10
+  return num.toString(36).padStart(10, '0');
 }
 
-// Method C: encrypt the origin URL with AES-256-GCM and Base64URL encode
-// (secret key from ENV, fallback to a static key – WARN: not persistent)
+// C: encrypt the origin URL with AES-256-GCM (self-contained)
 function generateSlugC(originUrl) {
   const algorithm = 'aes-256-gcm';
-  const secret = process.env.ENCRYPTION_KEY || '12345678901234567890123456789012'; // 32 bytes
+  const secret = process.env.ENCRYPTION_KEY || '12345678901234567890123456789012';
   const key = Buffer.from(secret, 'utf-8');
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv(algorithm, key, iv);
   let encrypted = cipher.update(originUrl, 'utf8', 'base64');
   encrypted += cipher.final('base64');
   const authTag = cipher.getAuthTag().toString('base64');
-  // Combine iv + authTag + encrypted, then base64url
   const combined = Buffer.concat([
     iv,
     Buffer.from(authTag, 'base64'),
@@ -169,19 +163,18 @@ function generateSlugC(originUrl) {
   return combined.toString('base64url').replace(/=/g, '');
 }
 
-// Method D: SHA-256 hash of (originUrl + secret salt), take first 12 hex chars
+// D: SHA-256 hash of (originUrl + salt), first 12 hex chars
 function generateSlugD(originUrl) {
   const salt = process.env.SALT_SECRET || 'defaultSalt';
   const hash = crypto.createHash('sha256').update(originUrl + salt).digest('hex');
   return hash.slice(0, 12);
 }
 
-// Method E: crypto.randomBytes -> base64url, length 10 (recommended)
+// E: crypto.randomBytes -> base64url, length 10 (recommended)
 function generateSlugE() {
   return crypto.randomBytes(8).toString('base64url').slice(0, 10);
 }
 
-// Generic slug generator that picks method
 function generateSlug(method, originUrl) {
   switch (method) {
     case 'A': return generateSlugA();
@@ -198,10 +191,8 @@ function validateURL(urlString) {
     const url = new URL(urlString);
     const hostname = url.hostname;
     if (
-      hostname === 'localhost' ||
-      hostname === '127.0.0.1' ||
-      hostname.startsWith('192.168.') ||
-      hostname.startsWith('10.') ||
+      hostname === 'localhost' || hostname === '127.0.0.1' ||
+      hostname.startsWith('192.168.') || hostname.startsWith('10.') ||
       hostname.startsWith('172.')
     ) {
       return false;
@@ -253,6 +244,7 @@ function getClientIP(req) {
 // API ENDPOINTS
 // ============================================================================
 
+// GET all active proxies
 app.get('/api/proxies', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM proxies WHERE enabled = 1 ORDER BY created_at DESC');
@@ -263,11 +255,12 @@ app.get('/api/proxies', async (req, res) => {
   }
 });
 
+// POST create a new proxy (with method selection)
 app.post('/api/proxies', async (req, res) => {
-  const { origin_url, name, method = 'A' } = req.body;  // accept method
+  const { origin_url, name, method = 'A' } = req.body;
 
   if (!origin_url || !name) {
-    return res.status(400).json({ error: 'Missing origin_url or name. Please enter both URL and proxy name.' });
+    return res.status(400).json({ error: 'Missing origin_url or name.' });
   }
 
   // Validate URL
@@ -276,9 +269,10 @@ app.post('/api/proxies', async (req, res) => {
     const hostname = urlObj.hostname;
     if (
       hostname === 'localhost' || hostname === '127.0.0.1' ||
-      hostname.startsWith('192.168.') || hostname.startsWith('10.') || hostname.startsWith('172.')
+      hostname.startsWith('192.168.') || hostname.startsWith('10.') ||
+      hostname.startsWith('172.')
     ) {
-      return res.status(400).json({ error: 'Cannot proxy private/internal URLs' });
+      return res.status(400).json({ error: 'Cannot proxy private/internal URLs.' });
     }
   } catch (e) {
     return res.status(400).json({ error: `Invalid URL format: ${e.message}` });
@@ -286,9 +280,8 @@ app.post('/api/proxies', async (req, res) => {
 
   const originUrl = origin_url.startsWith('http') ? origin_url : `https://${origin_url}`;
 
-  // Optional reachability test (kept)
+  // Optional reachability test (fast HEAD)
   try {
-    console.log(`Testing connectivity to: ${originUrl}`);
     const testResponse = await fetch(originUrl, { method: 'HEAD', timeout: 8000, redirect: 'follow' });
     if (testResponse.status === 404) {
       return res.status(400).json({ error: 'URL returned 404 Not Found.' });
@@ -300,7 +293,7 @@ app.post('/api/proxies', async (req, res) => {
     return res.status(400).json({ error: 'Cannot reach the URL. The server may be offline.' });
   }
 
-  // Generate slug based on chosen method
+  // Generate slug
   let id;
   try {
     id = generateSlug(method, originUrl);
@@ -308,7 +301,7 @@ app.post('/api/proxies', async (req, res) => {
     return res.status(500).json({ error: 'Slug generation failed: ' + err.message });
   }
 
-  // Ensure ID uniqueness (if collision, retry with A method)
+  // Collision handling (fallback to method A)
   let exists = true;
   let attempts = 0;
   while (exists && attempts < 5) {
@@ -316,8 +309,7 @@ app.post('/api/proxies', async (req, res) => {
     if (check.rows.length === 0) {
       exists = false;
     } else {
-      // Collision – regenerate with a fallback
-      id = generateSlug('A', originUrl); // fallback to A
+      id = generateSlug('A', originUrl);
       attempts++;
     }
   }
@@ -338,6 +330,7 @@ app.post('/api/proxies', async (req, res) => {
   }
 });
 
+// DELETE (soft-delete) a proxy
 app.delete('/api/proxies/:id', async (req, res) => {
   const { id } = req.params;
   try {
@@ -349,6 +342,7 @@ app.delete('/api/proxies/:id', async (req, res) => {
   }
 });
 
+// GET statistics
 app.get('/api/stats', async (req, res) => {
   try {
     const clickResult = await pool.query(
@@ -397,6 +391,7 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
+// POST record analytics (used by frontend)
 app.post('/api/stats/:proxyId', async (req, res) => {
   const { proxyId } = req.params;
   const { visitor_id } = req.body;
@@ -423,8 +418,22 @@ app.post('/api/stats/:proxyId', async (req, res) => {
   }
 });
 
+// ===== NEW: RESET STATISTICS =====
+app.post('/api/stats/reset', async (req, res) => {
+  try {
+    // Delete all analytics rows
+    await pool.query('DELETE FROM analytics');
+    // Reset click counters in proxies
+    await pool.query('UPDATE proxies SET total_clicks = 0, unique_visitors = 0, last_accessed = NULL');
+    res.json({ success: true, message: 'All statistics have been reset.' });
+  } catch (err) {
+    console.error('Error resetting stats:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ============================================================================
-// PROXY ROUTE - REDIRECT (with stats logging)
+// PROXY ROUTE - REDIRECT (with analytics logging)
 // ============================================================================
 
 app.all('/:proxyId*', async (req, res) => {
@@ -442,7 +451,7 @@ app.all('/:proxyId*', async (req, res) => {
       return res.status(404).json({ error: 'Proxy not found' });
     }
 
-    // Analytics tracking (non-blocking)
+    // Log analytics (non-blocking)
     const userAgent = req.get('user-agent');
     const clientIP = getClientIP(req);
     const device = getDeviceType(userAgent);
