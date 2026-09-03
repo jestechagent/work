@@ -487,30 +487,13 @@ app.all('/:proxyId*', async (req, res) => {
       return res.status(404).json({ error: 'Proxy not found' });
     }
 
-    // ===== AUTOMATIC ANALYTICS TRACKING =====
+    // Collect analytics data (will be recorded after response is sent)
     const userAgent = req.get('user-agent');
     const clientIP = getClientIP(req);
     const device = getDeviceType(userAgent);
     const browser = getBrowserType(userAgent);
     const country = getCountryFromIP(clientIP);
     const visitorId = 'visitor_' + Math.random().toString(36).substr(2, 9);
-
-    // Insert analytics record (non-blocking)
-    pool.query(
-      `INSERT INTO analytics 
-       (proxy_id, visitor_id, ip_address, device, browser, country, path)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [proxyId, visitorId, clientIP, device, browser, country, path || '/']
-    ).catch(err => console.error('Error logging analytics:', err));
-
-    // Update proxy stats (non-blocking)
-    pool.query(
-      `UPDATE proxies 
-       SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [proxyId]
-    ).catch(err => console.error('Error updating proxy stats:', err));
-    // ===== END TRACKING =====
 
     try {
       // Build target URL - preserve full origin URL including paths
@@ -584,7 +567,19 @@ app.all('/:proxyId*', async (req, res) => {
             });
             
             // Send response immediately without buffering
-            return res.end();
+            res.end();
+            
+            // Record analytics AFTER response is sent (fire and forget)
+            setTimeout(() => {
+              pool.query(
+                `UPDATE proxies 
+                 SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP
+                 WHERE id = $1`,
+                [proxyId]
+              ).catch(err => console.error('Error updating proxy stats:', err));
+            }, 0);
+            
+            return;
           } else {
             console.log(`[REDIRECT] Internal redirect detected - rewriting to stay on proxy`);
             
@@ -605,7 +600,19 @@ app.all('/:proxyId*', async (req, res) => {
               }
             });
             
-            return res.end();
+            res.end();
+            
+            // Record analytics AFTER response is sent (fire and forget)
+            setTimeout(() => {
+              pool.query(
+                `UPDATE proxies 
+                 SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP
+                 WHERE id = $1`,
+                [proxyId]
+              ).catch(err => console.error('Error updating proxy stats:', err));
+            }, 0);
+            
+            return;
           }
         } catch (e) {
           console.error('[REDIRECT] Error handling redirect:', e);
@@ -622,7 +629,19 @@ app.all('/:proxyId*', async (req, res) => {
             }
           });
           
-          return res.end();
+          res.end();
+          
+          // Record analytics AFTER response is sent (fire and forget)
+          setTimeout(() => {
+            pool.query(
+              `UPDATE proxies 
+               SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP
+               WHERE id = $1`,
+              [proxyId]
+            ).catch(err => console.error('Error updating proxy stats:', err));
+          }, 0);
+          
+          return;
         }
       }
       // ===== END REDIRECT HANDLING =====
@@ -646,6 +665,23 @@ app.all('/:proxyId*', async (req, res) => {
       });
 
       res.status(response.status).send(body);
+      
+      // Record analytics AFTER response is sent (fire and forget)
+      setTimeout(() => {
+        pool.query(
+          `INSERT INTO analytics 
+           (proxy_id, visitor_id, ip_address, device, browser, country, path)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [proxyId, visitorId, clientIP, device, browser, country, path || '/']
+        ).catch(err => console.error('Error logging analytics:', err));
+
+        pool.query(
+          `UPDATE proxies 
+           SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP
+           WHERE id = $1`,
+          [proxyId]
+        ).catch(err => console.error('Error updating proxy stats:', err));
+      }, 0);
     } catch (error) {
       console.error('Proxy error:', error);
       res.status(502).json({
