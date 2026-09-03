@@ -9,8 +9,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ============================================================
-// 1.  RATE LIMITER (in-memory, per IP, 10 requests/minute)
-//     - Will be applied only to proxy and API routes
+// 1.  RATE LIMITER (in-memory, per IP)
+//     - Applied ONLY to proxy redirects (/:proxyId*)
+//     - NOT applied to API or static assets
 // ============================================================
 const rateLimitStore = new Map();
 
@@ -18,7 +19,7 @@ const rateLimiter = (req, res, next) => {
   const ip = req.ip || req.connection.remoteAddress || '0.0.0.0';
   const now = Date.now();
   const windowMs = 60 * 1000;   // 1 minute
-  const maxRequests = 10;
+  const maxRequests = 10;        // 10 redirects per minute per IP
 
   if (!rateLimitStore.has(ip)) {
     rateLimitStore.set(ip, { count: 1, resetTime: now + windowMs });
@@ -27,22 +28,20 @@ const rateLimiter = (req, res, next) => {
 
   const record = rateLimitStore.get(ip);
 
-  // Reset if window expired
   if (now > record.resetTime) {
     rateLimitStore.set(ip, { count: 1, resetTime: now + windowMs });
     return next();
   }
 
-  // Increment
   record.count += 1;
   if (record.count > maxRequests) {
-    return res.status(429).json({ error: 'Too many requests, please slow down.' });
+    return res.status(429).json({ error: 'Too many redirects, please slow down.' });
   }
 
   next();
 };
 
-// Clean up expired entries periodically
+// Clean up expired entries every minute
 setInterval(() => {
   const now = Date.now();
   for (const [ip, record] of rateLimitStore.entries()) {
@@ -53,9 +52,7 @@ setInterval(() => {
 }, 60000);
 
 // ============================================================
-// 2.  USER-AGENT FILTERING (block bots)
-//     Applied globally to all routes (including frontend)
-//     because we don't want bots scraping the admin page either.
+// 2.  USER-AGENT FILTERING (block bots – applies to all)
 // ============================================================
 const BOT_UA_PATTERNS = [
   /curl/i, /python-requests/i, /headless/i, /phantomjs/i,
@@ -142,7 +139,7 @@ initializeDatabase().catch(err => {
 });
 
 // ============================================================
-// 4.  EXPRESS MIDDLEWARE (global: JSON, static, CORS, bot filter)
+// 4.  EXPRESS MIDDLEWARE (global)
 // ============================================================
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
@@ -252,11 +249,8 @@ function getCountryFromIP(ip) {
 }
 
 // ============================================================
-// 7.  API ENDPOINTS (with rate limiting)
+// 7.  API ENDPOINTS (no rate limiting – free for admin)
 // ============================================================
-// Apply rate limiter to all API routes
-app.use('/api', rateLimiter);
-
 app.get('/api/proxies', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM proxies WHERE enabled = 1 ORDER BY created_at DESC');
@@ -285,7 +279,6 @@ app.post('/api/proxies', async (req, res) => {
     return res.status(400).json({ error: `Invalid URL: ${e.message}` });
   }
 
-  // Quick reachability test
   try {
     const test = await fetch(originUrl, { method: 'HEAD', timeout: 8000, redirect: 'follow' });
     if (test.status === 404) return res.status(400).json({ error: 'URL returned 404 Not Found.' });
@@ -418,7 +411,6 @@ app.all('/:proxyId*', async (req, res) => {
   const proxyId = req.params.proxyId;
   let path = req.params[0] || '';
 
-  // Don't interfere with API routes (they are handled above)
   if (proxyId.startsWith('api')) {
     return res.status(404).json({ error: 'Not found' });
   }
@@ -430,7 +422,7 @@ app.all('/:proxyId*', async (req, res) => {
       return res.status(404).json({ error: 'Proxy not found' });
     }
 
-    // ===== ANALYTICS TRACKING (with error handling) =====
+    // Analytics (non‑blocking)
     const ua = req.get('user-agent') || '';
     const ip = getClientIP(req);
     const device = getDeviceType(ua);
@@ -438,18 +430,16 @@ app.all('/:proxyId*', async (req, res) => {
     const country = getCountryFromIP(ip);
     const visitorId = 'visitor_' + Math.random().toString(36).substr(2, 9);
 
-    // Insert analytics record (non‑blocking, but we log errors)
     pool.query(
       `INSERT INTO analytics (proxy_id, visitor_id, ip_address, device, browser, country, path)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [proxyId, visitorId, ip, device, browser, country, path || '/']
     ).then(() => {
-      // After analytics inserted, update proxy total_clicks
       pool.query(
         `UPDATE proxies SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = $1`,
         [proxyId]
-      ).catch(err => console.error('Error updating proxy stats:', err));
-    }).catch(err => console.error('Error logging analytics:', err));
+      ).catch(err => console.error('Update error:', err));
+    }).catch(err => console.error('Analytics insert error:', err));
 
     // Build target URL
     const originUrlObj = new URL(proxy.origin_url);
@@ -466,7 +456,6 @@ app.all('/:proxyId*', async (req, res) => {
     }
 
     console.log(`[REDIRECT] ${proxyId} -> ${targetUrl.toString()}`);
-    // Send redirect immediately – analytics runs in background
     res.redirect(302, targetUrl.toString());
   } catch (err) {
     console.error('Redirect error:', err);
