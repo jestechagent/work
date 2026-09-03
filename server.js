@@ -463,7 +463,7 @@ app.post('/api/stats/:proxyId', async (req, res) => {
 });
 
 // ============================================================================
-// PROXY ROUTES - WITH REAL-TIME CLICK TRACKING
+// PROXY ROUTES - WITH REAL-TIME CLICK TRACKING (FIXED REDIRECTS)
 // ============================================================================
 
 app.all('/:proxyId*', async (req, res) => {
@@ -557,10 +557,8 @@ app.all('/:proxyId*', async (req, res) => {
       const contentType = response.headers.get('content-type');
       const locationHeader = response.headers.get('location');
 
-      let body = await response.buffer();
-
-      // ===== HANDLE REDIRECTS =====
-      // Check if response is a redirect (3xx status code)
+      // ===== HANDLE REDIRECTS IMMEDIATELY =====
+      // Check if response is a redirect (3xx status code) before reading body
       if (response.status >= 300 && response.status < 400 && locationHeader) {
         try {
           console.log(`[REDIRECT] Status: ${response.status}, Location: ${locationHeader}`);
@@ -628,6 +626,9 @@ app.all('/:proxyId*', async (req, res) => {
         }
       }
       // ===== END REDIRECT HANDLING =====
+
+      // Only read the body if it's NOT a redirect
+      let body = await response.buffer();
 
       // Rewrite HTML if it's HTML content
       if (contentType && contentType.includes('text/html')) {
