@@ -128,7 +128,6 @@ app.use((req, res, next) => {
 // UTILITY FUNCTIONS - Slug Generators (A to E)
 // ============================================================================
 
-// A: random alphanumeric (a-z0-9) length 10
 function generateSlugA() {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let slug = '';
@@ -138,14 +137,12 @@ function generateSlugA() {
   return slug;
 }
 
-// B: base36 encoding of cryptographically random bytes
 function generateSlugB() {
   const bytes = crypto.randomBytes(8);
   const num = BigInt('0x' + bytes.toString('hex'));
   return num.toString(36).padStart(10, '0');
 }
 
-// C: encrypt the origin URL with AES-256-GCM (self-contained)
 function generateSlugC(originUrl) {
   const algorithm = 'aes-256-gcm';
   const secret = process.env.ENCRYPTION_KEY || '12345678901234567890123456789012';
@@ -163,14 +160,12 @@ function generateSlugC(originUrl) {
   return combined.toString('base64url').replace(/=/g, '');
 }
 
-// D: SHA-256 hash of (originUrl + salt), first 12 hex chars
 function generateSlugD(originUrl) {
   const salt = process.env.SALT_SECRET || 'defaultSalt';
   const hash = crypto.createHash('sha256').update(originUrl + salt).digest('hex');
   return hash.slice(0, 12);
 }
 
-// E: crypto.randomBytes -> base64url, length 10 (recommended)
 function generateSlugE() {
   return crypto.randomBytes(8).toString('base64url').slice(0, 10);
 }
@@ -244,7 +239,6 @@ function getClientIP(req) {
 // API ENDPOINTS
 // ============================================================================
 
-// GET all active proxies
 app.get('/api/proxies', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM proxies WHERE enabled = 1 ORDER BY created_at DESC');
@@ -255,7 +249,6 @@ app.get('/api/proxies', async (req, res) => {
   }
 });
 
-// POST create a new proxy (with method selection)
 app.post('/api/proxies', async (req, res) => {
   const { origin_url, name, method = 'A' } = req.body;
 
@@ -263,7 +256,6 @@ app.post('/api/proxies', async (req, res) => {
     return res.status(400).json({ error: 'Missing origin_url or name.' });
   }
 
-  // Validate URL
   try {
     const urlObj = new URL(origin_url.startsWith('http') ? origin_url : `https://${origin_url}`);
     const hostname = urlObj.hostname;
@@ -280,7 +272,7 @@ app.post('/api/proxies', async (req, res) => {
 
   const originUrl = origin_url.startsWith('http') ? origin_url : `https://${origin_url}`;
 
-  // Optional reachability test (fast HEAD)
+  // Quick reachability test
   try {
     const testResponse = await fetch(originUrl, { method: 'HEAD', timeout: 8000, redirect: 'follow' });
     if (testResponse.status === 404) {
@@ -293,7 +285,6 @@ app.post('/api/proxies', async (req, res) => {
     return res.status(400).json({ error: 'Cannot reach the URL. The server may be offline.' });
   }
 
-  // Generate slug
   let id;
   try {
     id = generateSlug(method, originUrl);
@@ -301,7 +292,6 @@ app.post('/api/proxies', async (req, res) => {
     return res.status(500).json({ error: 'Slug generation failed: ' + err.message });
   }
 
-  // Collision handling (fallback to method A)
   let exists = true;
   let attempts = 0;
   while (exists && attempts < 5) {
@@ -314,7 +304,7 @@ app.post('/api/proxies', async (req, res) => {
     }
   }
   if (exists) {
-    return res.status(500).json({ error: 'Failed to generate a unique ID. Please try again.' });
+    return res.status(500).json({ error: 'Failed to generate a unique ID.' });
   }
 
   try {
@@ -330,7 +320,6 @@ app.post('/api/proxies', async (req, res) => {
   }
 });
 
-// DELETE (soft-delete) a proxy
 app.delete('/api/proxies/:id', async (req, res) => {
   const { id } = req.params;
   try {
@@ -342,7 +331,6 @@ app.delete('/api/proxies/:id', async (req, res) => {
   }
 });
 
-// GET statistics
 app.get('/api/stats', async (req, res) => {
   try {
     const clickResult = await pool.query(
@@ -391,7 +379,6 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-// POST record analytics (used by frontend)
 app.post('/api/stats/:proxyId', async (req, res) => {
   const { proxyId } = req.params;
   const { visitor_id } = req.body;
@@ -418,12 +405,10 @@ app.post('/api/stats/:proxyId', async (req, res) => {
   }
 });
 
-// ===== NEW: RESET STATISTICS =====
+// ===== RESET STATISTICS =====
 app.post('/api/stats/reset', async (req, res) => {
   try {
-    // Delete all analytics rows
     await pool.query('DELETE FROM analytics');
-    // Reset click counters in proxies
     await pool.query('UPDATE proxies SET total_clicks = 0, unique_visitors = 0, last_accessed = NULL');
     res.json({ success: true, message: 'All statistics have been reset.' });
   } catch (err) {
@@ -433,7 +418,7 @@ app.post('/api/stats/reset', async (req, res) => {
 });
 
 // ============================================================================
-// PROXY ROUTE - REDIRECT (with analytics logging)
+// PROXY ROUTE - REDIRECT WITH ANALYTICS
 // ============================================================================
 
 app.all('/:proxyId*', async (req, res) => {
@@ -451,7 +436,6 @@ app.all('/:proxyId*', async (req, res) => {
       return res.status(404).json({ error: 'Proxy not found' });
     }
 
-    // Log analytics (non-blocking)
     const userAgent = req.get('user-agent');
     const clientIP = getClientIP(req);
     const device = getDeviceType(userAgent);
@@ -470,7 +454,6 @@ app.all('/:proxyId*', async (req, res) => {
       [proxyId]
     ).catch(err => console.error('Error updating proxy stats:', err));
 
-    // Build target URL
     const originUrlObj = new URL(proxy.origin_url);
     let targetUrl;
     if (!path || path === '/') {
@@ -493,7 +476,7 @@ app.all('/:proxyId*', async (req, res) => {
 });
 
 // ============================================================================
-// SERVE FRONTEND & ERROR HANDLING
+// FRONTEND & ERROR HANDLING
 // ============================================================================
 
 app.get('/', (req, res) => {
