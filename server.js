@@ -1,8 +1,12 @@
 const express = require('express');
 const { Pool } = require('pg');
-const fetch = require('node-fetch');   // kept for connectivity checks when creating proxies
+const fetch = require('node-fetch');
 const geoip = require('geoip-lite');
 const path = require('path');
+const crypto = require('crypto');
+
+// ----- New: rate limiting & bot detection -----
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,7 +31,6 @@ async function initializeDatabase() {
   try {
     await client.query('BEGIN');
 
-    // Create proxies table
     await client.query(`
       CREATE TABLE IF NOT EXISTS proxies (
         id TEXT PRIMARY KEY,
@@ -41,7 +44,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Create analytics table
     await client.query(`
       CREATE TABLE IF NOT EXISTS analytics (
         id SERIAL PRIMARY KEY,
@@ -58,7 +60,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Create index for better query performance
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_analytics_proxy_id ON analytics(proxy_id)
     `);
@@ -74,7 +75,6 @@ async function initializeDatabase() {
   }
 }
 
-// Initialize database on startup
 initializeDatabase().catch(err => {
   console.error('Failed to initialize database:', err);
   process.exit(-1);
@@ -85,33 +85,117 @@ initializeDatabase().catch(err => {
 // ============================================================================
 
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(express.static('public'));
 
-// Add CORS headers
+// CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   next();
 });
 
+// ----- 1. RATE LIMITING: 10 requests per minute per IP -----
+const limiter = rateLimit({
+  windowMs: 60 * 1000,          // 1 minute
+  max: 10,
+  message: 'Too many requests from this IP, please slow down.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(limiter);  // applies to all routes
+
+// ----- 2. USER-AGENT FILTERING (block bots) -----
+const BOT_UA_PATTERNS = [
+  /curl/i, /python-requests/i, /headless/i, /phantomjs/i,
+  /selenium/i, /puppeteer/i, /http-client/i, /wget/i,
+  /libwww/i, /faraday/i, /go-http-client/i, /java/i,
+  /perl/i, /ruby/i, /scrapy/i, /apache-httpclient/i,
+  /axios/i, /node-fetch/i, /postman/i, /insomnia/i,
+];
+
+function isBot(userAgent) {
+  if (!userAgent) return true;
+  return BOT_UA_PATTERNS.some(pattern => pattern.test(userAgent));
+}
+
+app.use((req, res, next) => {
+  const ua = req.get('user-agent') || '';
+  if (isBot(ua)) {
+    console.log(`Blocked bot: ${req.ip} - UA: ${ua}`);
+    return res.status(403).json({ error: 'Access denied.' });
+  }
+  next();
+});
+
 // ============================================================================
-// UTILITY FUNCTIONS
+// UTILITY FUNCTIONS (Slug generation methods A–E)
 // ============================================================================
 
-function generateSlug(length = 8) {
+// Method A: random alphanumeric (a-z0-9) length 10
+function generateSlugA() {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let slug = '';
-  for (let i = 0; i < length; i++) {
+  for (let i = 0; i < 10; i++) {
     slug += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return slug;
 }
 
+// Method B: base36 encoding of cryptographically random bytes
+function generateSlugB() {
+  const bytes = crypto.randomBytes(8); // 64-bit
+  const num = BigInt('0x' + bytes.toString('hex'));
+  return num.toString(36).padStart(10, '0'); // length 10
+}
+
+// Method C: encrypt the origin URL with AES-256-GCM and Base64URL encode
+// (secret key from ENV, fallback to a static key – WARN: not persistent)
+function generateSlugC(originUrl) {
+  const algorithm = 'aes-256-gcm';
+  const secret = process.env.ENCRYPTION_KEY || '12345678901234567890123456789012'; // 32 bytes
+  const key = Buffer.from(secret, 'utf-8');
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(algorithm, key, iv);
+  let encrypted = cipher.update(originUrl, 'utf8', 'base64');
+  encrypted += cipher.final('base64');
+  const authTag = cipher.getAuthTag().toString('base64');
+  // Combine iv + authTag + encrypted, then base64url
+  const combined = Buffer.concat([
+    iv,
+    Buffer.from(authTag, 'base64'),
+    Buffer.from(encrypted, 'base64')
+  ]);
+  return combined.toString('base64url').replace(/=/g, '');
+}
+
+// Method D: SHA-256 hash of (originUrl + secret salt), take first 12 hex chars
+function generateSlugD(originUrl) {
+  const salt = process.env.SALT_SECRET || 'defaultSalt';
+  const hash = crypto.createHash('sha256').update(originUrl + salt).digest('hex');
+  return hash.slice(0, 12);
+}
+
+// Method E: crypto.randomBytes -> base64url, length 10 (recommended)
+function generateSlugE() {
+  return crypto.randomBytes(8).toString('base64url').slice(0, 10);
+}
+
+// Generic slug generator that picks method
+function generateSlug(method, originUrl) {
+  switch (method) {
+    case 'A': return generateSlugA();
+    case 'B': return generateSlugB();
+    case 'C': return generateSlugC(originUrl);
+    case 'D': return generateSlugD(originUrl);
+    case 'E': return generateSlugE();
+    default: return generateSlugA();
+  }
+}
+
 function validateURL(urlString) {
   try {
     const url = new URL(urlString);
-    // Block private/internal IPs
     const hostname = url.hostname;
     if (
       hostname === 'localhost' ||
@@ -169,7 +253,6 @@ function getClientIP(req) {
 // API ENDPOINTS
 // ============================================================================
 
-// Get all proxies
 app.get('/api/proxies', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM proxies WHERE enabled = 1 ORDER BY created_at DESC');
@@ -180,80 +263,66 @@ app.get('/api/proxies', async (req, res) => {
   }
 });
 
-// Create new proxy
 app.post('/api/proxies', async (req, res) => {
-  const { origin_url, name } = req.body;
+  const { origin_url, name, method = 'A' } = req.body;  // accept method
 
   if (!origin_url || !name) {
     return res.status(400).json({ error: 'Missing origin_url or name. Please enter both URL and proxy name.' });
   }
 
-  // Validate URL format
+  // Validate URL
   try {
     const urlObj = new URL(origin_url.startsWith('http') ? origin_url : `https://${origin_url}`);
-    
-    // Check for private IPs
     const hostname = urlObj.hostname;
     if (
-      hostname === 'localhost' ||
-      hostname === '127.0.0.1' ||
-      hostname.startsWith('192.168.') ||
-      hostname.startsWith('10.') ||
-      hostname.startsWith('172.')
+      hostname === 'localhost' || hostname === '127.0.0.1' ||
+      hostname.startsWith('192.168.') || hostname.startsWith('10.') || hostname.startsWith('172.')
     ) {
-      return res.status(400).json({ 
-        error: 'Cannot proxy private/internal URLs (localhost, 192.168.x.x, 10.x.x.x, 172.x.x.x)' 
-      });
+      return res.status(400).json({ error: 'Cannot proxy private/internal URLs' });
     }
   } catch (e) {
-    return res.status(400).json({ 
-      error: `Invalid URL format. Make sure to include https:// (e.g., https://example.com). Error: ${e.message}` 
-    });
+    return res.status(400).json({ error: `Invalid URL format: ${e.message}` });
   }
 
-  const id = generateSlug();
   const originUrl = origin_url.startsWith('http') ? origin_url : `https://${origin_url}`;
 
-  // Test if URL is reachable before creating proxy
+  // Optional reachability test (kept)
   try {
     console.log(`Testing connectivity to: ${originUrl}`);
-    const testResponse = await fetch(originUrl, { 
-      method: 'HEAD',
-      timeout: 8000,
-      redirect: 'follow'
-    });
-    
-    console.log(`Response from ${originUrl}: ${testResponse.status} ${testResponse.statusText}`);
-    
+    const testResponse = await fetch(originUrl, { method: 'HEAD', timeout: 8000, redirect: 'follow' });
     if (testResponse.status === 404) {
-      return res.status(400).json({ 
-        error: `URL returned 404 Not Found. Please verify the path is correct.`,
-        details: `URL: ${originUrl}`,
-        hint: 'The server responded with 404. Check if the exact path exists on the server.'
-      });
+      return res.status(400).json({ error: 'URL returned 404 Not Found.' });
     }
-    
     if (testResponse.status >= 500) {
-      return res.status(400).json({ 
-        error: `Server error (${testResponse.status}). The target server returned an error.`,
-        details: `URL: ${originUrl}`
-      });
+      return res.status(400).json({ error: `Server error (${testResponse.status})` });
     }
-    
-    console.log(`✅ URL is reachable: ${originUrl}`);
   } catch (testErr) {
-    console.error(`❌ Cannot reach URL: ${originUrl}`, testErr.message);
-    return res.status(400).json({ 
-      error: `Cannot reach the URL. The server may be offline or inaccessible.`,
-      details: `URL: ${originUrl}`,
-      technical_error: testErr.message,
-      hints: [
-        '1. Make sure the URL is correct and online',
-        '2. Check if it\'s accessible from the internet (not behind a firewall)',
-        '3. Try visiting the URL in your browser first to verify it works',
-        '4. If using a dynamic DNS, make sure it\'s updated correctly'
-      ]
-    });
+    return res.status(400).json({ error: 'Cannot reach the URL. The server may be offline.' });
+  }
+
+  // Generate slug based on chosen method
+  let id;
+  try {
+    id = generateSlug(method, originUrl);
+  } catch (err) {
+    return res.status(500).json({ error: 'Slug generation failed: ' + err.message });
+  }
+
+  // Ensure ID uniqueness (if collision, retry with A method)
+  let exists = true;
+  let attempts = 0;
+  while (exists && attempts < 5) {
+    const check = await pool.query('SELECT id FROM proxies WHERE id = $1', [id]);
+    if (check.rows.length === 0) {
+      exists = false;
+    } else {
+      // Collision – regenerate with a fallback
+      id = generateSlug('A', originUrl); // fallback to A
+      attempts++;
+    }
+  }
+  if (exists) {
+    return res.status(500).json({ error: 'Failed to generate a unique ID. Please try again.' });
   }
 
   try {
@@ -261,7 +330,6 @@ app.post('/api/proxies', async (req, res) => {
       'INSERT INTO proxies (id, name, origin_url) VALUES ($1, $2, $3)',
       [id, name, originUrl]
     );
-
     const proxyUrl = `https://${req.get('host')}/${id}`;
     res.json({ id, proxy_url: proxyUrl, name, origin_url: originUrl });
   } catch (err) {
@@ -270,10 +338,8 @@ app.post('/api/proxies', async (req, res) => {
   }
 });
 
-// Delete proxy
 app.delete('/api/proxies/:id', async (req, res) => {
   const { id } = req.params;
-
   try {
     await pool.query('UPDATE proxies SET enabled = 0 WHERE id = $1', [id]);
     res.json({ success: true });
@@ -283,78 +349,38 @@ app.delete('/api/proxies/:id', async (req, res) => {
   }
 });
 
-// Get global statistics
 app.get('/api/stats', async (req, res) => {
   try {
-    // Total clicks in last 24 hours
     const clickResult = await pool.query(
-      `SELECT COUNT(*) as total_clicks FROM analytics
-       WHERE timestamp > NOW() - INTERVAL '24 hours'`
+      `SELECT COUNT(*) as total_clicks FROM analytics WHERE timestamp > NOW() - INTERVAL '24 hours'`
     );
-
-    // Unique visitors in last 24 hours
     const visitorResult = await pool.query(
-      `SELECT COUNT(DISTINCT visitor_id) as unique_visitors FROM analytics
-       WHERE timestamp > NOW() - INTERVAL '24 hours'`
+      `SELECT COUNT(DISTINCT visitor_id) as unique_visitors FROM analytics WHERE timestamp > NOW() - INTERVAL '24 hours'`
     );
-
-    // Top 10 countries in last 24 hours
     const countryResult = await pool.query(
-      `SELECT country, COUNT(*) as count FROM analytics
-       WHERE country IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours'
-       GROUP BY country ORDER BY count DESC LIMIT 10`
+      `SELECT country, COUNT(*) as count FROM analytics WHERE country IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours' GROUP BY country ORDER BY count DESC LIMIT 10`
     );
-
-    // Devices in last 24 hours
     const deviceResult = await pool.query(
-      `SELECT device, COUNT(*) as count FROM analytics
-       WHERE device IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours'
-       GROUP BY device ORDER BY count DESC`
+      `SELECT device, COUNT(*) as count FROM analytics WHERE device IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours' GROUP BY device ORDER BY count DESC`
     );
-
-    // Browsers in last 24 hours
     const browserResult = await pool.query(
-      `SELECT browser, COUNT(*) as count FROM analytics
-       WHERE browser IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours'
-       GROUP BY browser ORDER BY count DESC`
+      `SELECT browser, COUNT(*) as count FROM analytics WHERE browser IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours' GROUP BY browser ORDER BY count DESC`
     );
-
-    // Traffic by hour in last 24 hours
     const trafficResult = await pool.query(
-      `SELECT EXTRACT(HOUR FROM timestamp)::int as hour, COUNT(*) as clicks
-       FROM analytics
-       WHERE timestamp > NOW() - INTERVAL '24 hours'
-       GROUP BY EXTRACT(HOUR FROM timestamp)
-       ORDER BY hour`
+      `SELECT EXTRACT(HOUR FROM timestamp)::int as hour, COUNT(*) as clicks FROM analytics WHERE timestamp > NOW() - INTERVAL '24 hours' GROUP BY EXTRACT(HOUR FROM timestamp) ORDER BY hour`
     );
 
-    // Build response objects
     const by_country = {};
-    countryResult.rows.forEach((row) => {
-      by_country[row.country] = parseInt(row.count);
-    });
-
+    countryResult.rows.forEach(row => by_country[row.country] = parseInt(row.count));
     const by_device = {};
-    deviceResult.rows.forEach((row) => {
-      by_device[row.device] = parseInt(row.count);
-    });
-
+    deviceResult.rows.forEach(row => by_device[row.device] = parseInt(row.count));
     const by_browser = {};
-    browserResult.rows.forEach((row) => {
-      by_browser[row.browser] = parseInt(row.count);
-    });
+    browserResult.rows.forEach(row => by_browser[row.browser] = parseInt(row.count));
 
-    // Generate last 24h traffic data
-    const last24h = [];
-    for (let i = 0; i < 24; i++) {
-      last24h.push({ hour: i, clicks: 0 });
-    }
-
-    trafficResult.rows.forEach((row) => {
-      const hourIndex = row.hour;
-      if (hourIndex >= 0 && hourIndex < 24) {
-        last24h[hourIndex].clicks = parseInt(row.clicks);
-      }
+    const last24h = Array.from({ length: 24 }, (_, i) => ({ hour: i, clicks: 0 }));
+    trafficResult.rows.forEach(row => {
+      const idx = row.hour;
+      if (idx >= 0 && idx < 24) last24h[idx].clicks = parseInt(row.clicks);
     });
 
     res.json({
@@ -363,7 +389,7 @@ app.get('/api/stats', async (req, res) => {
       by_country,
       by_device,
       by_browser,
-      last_24h: last24h,
+      last_24h,
     });
   } catch (err) {
     console.error('Error fetching stats:', err);
@@ -371,7 +397,6 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-// Record analytics for a proxy
 app.post('/api/stats/:proxyId', async (req, res) => {
   const { proxyId } = req.params;
   const { visitor_id } = req.body;
@@ -383,20 +408,14 @@ app.post('/api/stats/:proxyId', async (req, res) => {
 
   try {
     await pool.query(
-      `INSERT INTO analytics 
-       (proxy_id, visitor_id, ip_address, device, browser, country)
+      `INSERT INTO analytics (proxy_id, visitor_id, ip_address, device, browser, country)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [proxyId, visitor_id, clientIP, device, browser, country]
     );
-
-    // Update proxy stats
     await pool.query(
-      `UPDATE proxies 
-       SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP
-       WHERE id = $1`,
+      `UPDATE proxies SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = $1`,
       [proxyId]
     );
-
     res.json({ success: true });
   } catch (err) {
     console.error('Error recording analytics:', err);
@@ -405,31 +424,25 @@ app.post('/api/stats/:proxyId', async (req, res) => {
 });
 
 // ============================================================================
-// PROXY ROUTE - NOW PERFORMS A 302 REDIRECT (NO MIRRORING)
+// PROXY ROUTE - REDIRECT (with stats logging)
 // ============================================================================
 
 app.all('/:proxyId*', async (req, res) => {
   const proxyId = req.params.proxyId;
   let path = req.params[0] || '';
 
-  // Don't intercept API calls
   if (proxyId.startsWith('api')) {
     return res.status(404).json({ error: 'Not found' });
   }
 
   try {
-    const proxyResult = await pool.query(
-      'SELECT * FROM proxies WHERE id = $1 AND enabled = 1',
-      [proxyId]
-    );
-
+    const proxyResult = await pool.query('SELECT * FROM proxies WHERE id = $1 AND enabled = 1', [proxyId]);
     const proxy = proxyResult.rows[0];
-
     if (!proxy) {
       return res.status(404).json({ error: 'Proxy not found' });
     }
 
-    // ===== AUTOMATIC ANALYTICS TRACKING =====
+    // Analytics tracking (non-blocking)
     const userAgent = req.get('user-agent');
     const clientIP = getClientIP(req);
     const device = getDeviceType(userAgent);
@@ -437,27 +450,20 @@ app.all('/:proxyId*', async (req, res) => {
     const country = getCountryFromIP(clientIP);
     const visitorId = 'visitor_' + Math.random().toString(36).substr(2, 9);
 
-    // Insert analytics record (non-blocking)
     pool.query(
-      `INSERT INTO analytics 
-       (proxy_id, visitor_id, ip_address, device, browser, country, path)
+      `INSERT INTO analytics (proxy_id, visitor_id, ip_address, device, browser, country, path)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [proxyId, visitorId, clientIP, device, browser, country, path || '/']
     ).catch(err => console.error('Error logging analytics:', err));
 
-    // Update proxy stats (non-blocking)
     pool.query(
-      `UPDATE proxies 
-       SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP
-       WHERE id = $1`,
+      `UPDATE proxies SET total_clicks = total_clicks + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = $1`,
       [proxyId]
     ).catch(err => console.error('Error updating proxy stats:', err));
-    // ===== END TRACKING =====
 
-    // Build the full target URL (origin + path + query string)
+    // Build target URL
     const originUrlObj = new URL(proxy.origin_url);
     let targetUrl;
-
     if (!path || path === '/') {
       targetUrl = new URL(proxy.origin_url);
     } else {
@@ -465,13 +471,10 @@ app.all('/:proxyId*', async (req, res) => {
       const targetPath = originPath + path;
       targetUrl = new URL(targetPath, originUrlObj.origin);
     }
-
-    // Forward query string if present
     if (req.url.includes('?')) {
       targetUrl.search = req.url.substring(req.url.indexOf('?'));
     }
 
-    // ===== REDIRECT TO THE ORIGINAL SITE (302 Found) =====
     console.log(`[REDIRECT] ${proxyId} -> ${targetUrl.toString()}`);
     res.redirect(302, targetUrl.toString());
   } catch (err) {
@@ -484,7 +487,6 @@ app.all('/:proxyId*', async (req, res) => {
 // SERVE FRONTEND & ERROR HANDLING
 // ============================================================================
 
-// Serve index.html for root
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
@@ -496,10 +498,8 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Redirect Server running on port ${PORT}`);
-  console.log(`Server is accessible on 0.0.0.0:${PORT}`);
 });
 
-// Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('Shutting down gracefully...');
   await pool.end();
