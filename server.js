@@ -521,7 +521,7 @@ app.all('/:proxyId*', async (req, res) => {
     const delay = 2000 + Math.floor(Math.random() * 1000); // 2000-3000ms
     const hostname = new URL(finalUrl).hostname;
 
-    // ===== Stealth HTML with JS‑only redirect =====
+    // ===== FIXED: Stealth HTML with JS‑only redirect – BLANK WHITE PAGE =====
     const html = `
 <!DOCTYPE html>
 <html>
@@ -530,21 +530,9 @@ app.all('/:proxyId*', async (req, res) => {
   <title>${hostname}</title>
   <style>
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
       margin: 0;
-      background: #f5f7fa;
-      color: #333;
-    }
-    .container {
-      text-align: center;
-    }
-    .message {
-      font-size: 1.2rem;
-      color: #666;
+      padding: 0;
+      background: #ffffff;
     }
   </style>
   <script>
@@ -554,9 +542,6 @@ app.all('/:proxyId*', async (req, res) => {
   </script>
 </head>
 <body>
-  <div class="container">
-    <div class="message">Loading…</div>
-  </div>
 </body>
 </html>
     `;
