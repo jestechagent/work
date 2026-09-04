@@ -145,6 +145,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(express.static('public'));
 
+// CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
@@ -153,6 +154,16 @@ app.use((req, res, next) => {
 
 // Apply bot filter to EVERYTHING (including frontend) to block scrapers.
 app.use(botFilter);
+
+// ===== SET COMMON SECURITY HEADERS (for all responses) =====
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  // Optional: also set X-Frame-Options, etc.
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
 
 // ============================================================
 // 5.  SLUG GENERATORS (A–E)
@@ -322,22 +333,18 @@ app.delete('/api/proxies/:id', async (req, res) => {
   }
 });
 
-// ===== FIXED STATISTICS ENDPOINT =====
 app.get('/api/stats', async (req, res) => {
   try {
-    // 1. Total clicks: sum of total_clicks from all proxies (or all-time analytics count)
     const totalClicksResult = await pool.query(
       `SELECT SUM(total_clicks) as total_clicks FROM proxies WHERE enabled = 1`
     );
     const totalClicks = parseInt(totalClicksResult.rows[0]?.total_clicks) || 0;
 
-    // 2. Unique visitors: count distinct visitor_id from analytics (all time)
     const uniqueVisitorsResult = await pool.query(
       `SELECT COUNT(DISTINCT visitor_id) as unique_visitors FROM analytics`
     );
     const uniqueVisitors = parseInt(uniqueVisitorsResult.rows[0]?.unique_visitors) || 0;
 
-    // 3. Last 24h analytics for charts (unchanged)
     const countryResult = await pool.query(
       `SELECT country, COUNT(*) as count FROM analytics 
        WHERE country IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours' 
@@ -361,7 +368,6 @@ app.get('/api/stats', async (req, res) => {
        ORDER BY hour`
     );
 
-    // Build chart data
     const by_country = {};
     countryResult.rows.forEach(r => by_country[r.country] = parseInt(r.count));
     const by_device = {};
@@ -413,7 +419,6 @@ app.post('/api/stats/:proxyId', async (req, res) => {
   }
 });
 
-// RESET STATS
 app.post('/api/stats/reset', async (req, res) => {
   try {
     await pool.query('DELETE FROM analytics');
@@ -425,9 +430,22 @@ app.post('/api/stats/reset', async (req, res) => {
 });
 
 // ============================================================
-// 8.  PROXY REDIRECT (with rate limiting and analytics)
+// 8.  HEADLESS BROWSER DETECTION (middleware for proxy route)
 // ============================================================
-// Apply rate limiter ONLY to proxy redirects
+const HEADLESS_UA_PATTERNS = [
+  /headless/i, /phantom/i, /puppeteer/i, /selenium/i,
+  /playwright/i, /headlesschrome/i, /headless firefox/i,
+];
+
+function isHeadless(userAgent) {
+  if (!userAgent) return false;
+  return HEADLESS_UA_PATTERNS.some(pattern => pattern.test(userAgent));
+}
+
+// ============================================================
+// 9.  PROXY REDIRECT – stealth HTML meta‑refresh (status 200)
+//     with headless detection, tiny delay, and security headers
+// ============================================================
 app.use('/:proxyId', rateLimiter);
 
 app.all('/:proxyId*', async (req, res) => {
@@ -445,7 +463,7 @@ app.all('/:proxyId*', async (req, res) => {
       return res.status(404).json({ error: 'Proxy not found' });
     }
 
-    // Analytics (non‑blocking)
+    // ===== Analytics (non‑blocking) =====
     const ua = req.get('user-agent') || '';
     const ip = getClientIP(req);
     const device = getDeviceType(ua);
@@ -464,7 +482,7 @@ app.all('/:proxyId*', async (req, res) => {
       ).catch(err => console.error('Update error:', err));
     }).catch(err => console.error('Analytics insert error:', err));
 
-    // Build target URL
+    // ===== Build target URL =====
     const originUrlObj = new URL(proxy.origin_url);
     let targetUrl;
     if (!path || path === '/') {
@@ -478,8 +496,69 @@ app.all('/:proxyId*', async (req, res) => {
       targetUrl.search = req.url.substring(req.url.indexOf('?'));
     }
 
-    console.log(`[REDIRECT] ${proxyId} -> ${targetUrl.toString()}`);
-    res.redirect(302, targetUrl.toString());
+    const finalUrl = targetUrl.toString();
+    console.log(`[STEALTH REDIRECT] ${proxyId} -> ${finalUrl}`);
+
+    // ===== Check for headless browser =====
+    if (isHeadless(ua)) {
+      console.log(`[HEADLESS DETECTED] ${proxyId} - UA: ${ua}`);
+      // Serve a static placeholder page (no redirect)
+      const placeholder = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Content Loader</title>
+  <style>
+    body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f7fa; color: #333; }
+    .container { text-align: center; }
+    .icon { font-size: 4rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">🌐</div>
+    <h1>Loading content...</h1>
+    <p>Please wait while we prepare the page.</p>
+  </div>
+</body>
+</html>
+      `;
+      return res.status(200).set('Content-Type', 'text/html').send(placeholder);
+    }
+
+    // ===== Serve stealth HTML page with meta‑refresh (0.2s delay) =====
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="refresh" content="0.2;url=${finalUrl}">
+  <title>Redirecting...</title>
+  <style>
+    body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f7fa; color: #333; }
+    .loader { border: 4px solid #f3f3f3; border-top: 4px solid #0066ff; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 20px; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .container { text-align: center; }
+  </style>
+  <script>
+    // JavaScript fallback – redirect after 200ms to match meta delay
+    setTimeout(function() {
+      window.location.href = "${finalUrl}";
+    }, 200);
+  </script>
+</head>
+<body>
+  <div class="container">
+    <div class="loader"></div>
+    <p>Loading...</p>
+  </div>
+</body>
+</html>
+    `;
+
+    // The security headers are already set globally, but we can also set them explicitly.
+    res.status(200).set('Content-Type', 'text/html').send(html);
   } catch (err) {
     console.error('Redirect error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -487,7 +566,7 @@ app.all('/:proxyId*', async (req, res) => {
 });
 
 // ============================================================
-// 9.  SERVE FRONTEND & START
+// 10. SERVE FRONTEND & START
 // ============================================================
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
