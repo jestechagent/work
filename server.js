@@ -366,10 +366,10 @@ app.get('/api/stats', async (req, res) => {
     deviceResult.rows.forEach(r => by_device[r.device] = parseInt(r.count));
     const by_browser = {};
     browserResult.rows.forEach(r => by_browser[r.browser] = parseInt(r.count));
-    const last24h = Array.from({ length: 24 }, (_, i) => ({ hour: i, clicks: 0 }));
+    const last_24h = Array.from({ length: 24 }, (_, i) => ({ hour: i, clicks: 0 }));
     trafficResult.rows.forEach(r => {
       const h = r.hour;
-      if (h >= 0 && h < 24) last24h[h].clicks = parseInt(r.clicks);
+      if (h >= 0 && h < 24) last_24h[h].clicks = parseInt(r.clicks);
     });
 
     res.json({
