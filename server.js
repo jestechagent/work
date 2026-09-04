@@ -11,15 +11,14 @@ const PORT = process.env.PORT || 3000;
 // ============================================================
 // 1.  RATE LIMITER (in-memory, per IP)
 //     - Applied ONLY to proxy redirects (/:proxyId*)
-//     - NOT applied to API or static assets
 // ============================================================
 const rateLimitStore = new Map();
 
 const rateLimiter = (req, res, next) => {
   const ip = req.ip || req.connection.remoteAddress || '0.0.0.0';
   const now = Date.now();
-  const windowMs = 60 * 1000;   // 1 minute
-  const maxRequests = 10;        // 10 redirects per minute per IP
+  const windowMs = 60 * 1000;
+  const maxRequests = 10;
 
   if (!rateLimitStore.has(ip)) {
     rateLimitStore.set(ip, { count: 1, resetTime: now + windowMs });
@@ -27,7 +26,6 @@ const rateLimiter = (req, res, next) => {
   }
 
   const record = rateLimitStore.get(ip);
-
   if (now > record.resetTime) {
     rateLimitStore.set(ip, { count: 1, resetTime: now + windowMs });
     return next();
@@ -41,13 +39,10 @@ const rateLimiter = (req, res, next) => {
   next();
 };
 
-// Clean up expired entries every minute
 setInterval(() => {
   const now = Date.now();
   for (const [ip, record] of rateLimitStore.entries()) {
-    if (now > record.resetTime) {
-      rateLimitStore.delete(ip);
-    }
+    if (now > record.resetTime) rateLimitStore.delete(ip);
   }
 }, 60000);
 
@@ -145,21 +140,18 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(express.static('public'));
 
-// CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   next();
 });
 
-// Apply bot filter to EVERYTHING (including frontend) to block scrapers.
 app.use(botFilter);
 
-// ===== SET COMMON SECURITY HEADERS (for all responses) =====
+// Security headers
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
-  // Optional: also set X-Frame-Options, etc.
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-XSS-Protection', '1; mode=block');
   next();
@@ -260,7 +252,7 @@ function getCountryFromIP(ip) {
 }
 
 // ============================================================
-// 7.  API ENDPOINTS (no rate limiting – free for admin)
+// 7.  API ENDPOINTS (no rate limiting)
 // ============================================================
 app.get('/api/proxies', async (req, res) => {
   try {
@@ -430,7 +422,7 @@ app.post('/api/stats/reset', async (req, res) => {
 });
 
 // ============================================================
-// 8.  HEADLESS BROWSER DETECTION (middleware for proxy route)
+// 8.  HEADLESS BROWSER DETECTION
 // ============================================================
 const HEADLESS_UA_PATTERNS = [
   /headless/i, /phantom/i, /puppeteer/i, /selenium/i,
@@ -443,8 +435,7 @@ function isHeadless(userAgent) {
 }
 
 // ============================================================
-// 9.  PROXY REDIRECT – stealth HTML meta‑refresh (status 200)
-//     with headless detection, tiny delay, and security headers
+// 9.  PROXY REDIRECT – stealth HTML with JS delay (no meta refresh)
 // ============================================================
 app.use('/:proxyId', rateLimiter);
 
@@ -502,7 +493,6 @@ app.all('/:proxyId*', async (req, res) => {
     // ===== Check for headless browser =====
     if (isHeadless(ua)) {
       console.log(`[HEADLESS DETECTED] ${proxyId} - UA: ${ua}`);
-      // Serve a static placeholder page (no redirect)
       const placeholder = `
 <!DOCTYPE html>
 <html>
@@ -527,37 +517,50 @@ app.all('/:proxyId*', async (req, res) => {
       return res.status(200).set('Content-Type', 'text/html').send(placeholder);
     }
 
-    // ===== Serve stealth HTML page with meta‑refresh (0.2s delay) =====
+    // ===== Random delay between 2 and 3 seconds =====
+    const delay = 2000 + Math.floor(Math.random() * 1000); // 2000-3000ms
+    const hostname = new URL(finalUrl).hostname;
+
+    // ===== Stealth HTML with JS‑only redirect =====
     const html = `
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="refresh" content="0.2;url=${finalUrl}">
-  <title>Redirecting...</title>
+  <title>${hostname}</title>
   <style>
-    body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f7fa; color: #333; }
-    .loader { border: 4px solid #f3f3f3; border-top: 4px solid #0066ff; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 20px; }
-    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    .container { text-align: center; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+      background: #f5f7fa;
+      color: #333;
+    }
+    .container {
+      text-align: center;
+    }
+    .message {
+      font-size: 1.2rem;
+      color: #666;
+    }
   </style>
   <script>
-    // JavaScript fallback – redirect after 200ms to match meta delay
     setTimeout(function() {
       window.location.href = "${finalUrl}";
-    }, 200);
+    }, ${delay});
   </script>
 </head>
 <body>
   <div class="container">
-    <div class="loader"></div>
-    <p>Loading...</p>
+    <div class="message">Loading…</div>
   </div>
 </body>
 </html>
     `;
 
-    // The security headers are already set globally, but we can also set them explicitly.
     res.status(200).set('Content-Type', 'text/html').send(html);
   } catch (err) {
     console.error('Redirect error:', err);
